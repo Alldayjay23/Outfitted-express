@@ -30,7 +30,7 @@
       <div class="row">
         <div class="col">
           <label>Occasion</label>
-          <select id="occasion">
+          <select id="occasion" aria-label="Occasion">
             <option>Work</option>
             <option>Casual</option>
             <option>Formal</option>
@@ -39,13 +39,16 @@
         </div>
         <div class="col">
           <label>Weather</label>
-          <input id="weather" type="text" value="Mild/Sunny"/>
+          <input id="weather" type="text" value="Mild/Sunny" aria-label="Weather"/>
         </div>
       </div>
+
       <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
-        <input type="checkbox" id="dare"/> Dare mode (push style slightly)
+        <input type="checkbox" id="dare"/> Dare mode (adds a bold twist to Outfit B)
       </label>
-      <button id="goBtn" style="margin-top:10px;">Generate Outfits</button>
+
+      <button id="goBtn" style="margin-top:10px;">Style Me</button>
+      <div style="font-size:12px;color:#555;margin-top:6px;">Uses only clean items from your closet.</div>
       <div id="status" style="margin-top:8px;"></div>
     </div>
 
@@ -53,49 +56,74 @@
   </div>
 
   <script>
+    // --- helpers ---
+    const toArray = (x) => Array.isArray(x) ? x
+      : x && typeof x === 'object' ? Object.values(x)
+      : typeof x === 'string' ? [x] : [];
+
     async function postJSON(url, body) {
       const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-      if (!r.ok) throw new Error("Request failed");
+      if (!r.ok) throw new Error(await r.text());
       return r.json();
     }
 
-    const goBtn = document.getElementById("goBtn");
-    const status = document.getElementById("status");
-    const results = document.getElementById("results");
+    // thumbnail renderer
+    function itemRow(name, info) {
+      const li = document.createElement("li");
+      li.style.display = "flex";
+      li.style.alignItems = "center";
+      li.style.gap = "10px";
+      if (info?.photoUrl) {
+        const img = document.createElement("img");
+        img.src = info.photoUrl;
+        img.alt = name;
+        img.style.width = "36px";
+        img.style.height = "36px";
+        img.style.objectFit = "cover";
+        img.style.borderRadius = "8px";
+        img.referrerPolicy = "no-referrer";
+        li.appendChild(img);
+      }
+      const text = document.createElement("span");
+      text.textContent = name;
+      li.appendChild(text);
+      return li;
+    }
 
-    function renderOutfit(title, items) {
+    function renderOutfit(title, items, catalog) {
       const wrapper = document.createElement("div");
       wrapper.className = "card";
       const h = document.createElement("div");
       h.style.display = "flex";
       h.style.justifyContent = "space-between";
       h.style.alignItems = "center";
+
       const ht = document.createElement("div");
       ht.style.fontSize = "20px";
       ht.style.fontWeight = "700";
       ht.textContent = title;
+
       const gapBtn = document.createElement("button");
       gapBtn.textContent = "Gap Finder";
       gapBtn.onclick = async () => {
         const data = await postJSON("/api/gap", { outfit: items });
         const out = wrapper.querySelector(".gapRes");
-        if (data.missing_items.length === 0) {
+        if ((data.missing_items || []).length === 0) {
           out.innerHTML = `<div class="ok">No missing items 🎉</div>`;
         } else {
-          const msg = encodeURIComponent(`Need ${data.missing_items.join(", ")} delivered today.`);
-          out.innerHTML = `<div class="missing">Missing: ${data.missing_items.join(", ")} <a href="https://wa.me/?text=${msg}" target="_blank">Order Now</a></div>`;
+          const missing = data.missing_items.join(", ");
+          const wa = `https://wa.me/?text=${encodeURIComponent("Need " + missing + " delivered today.")}`;
+          const sms = `sms:?&body=${encodeURIComponent("Need " + missing + " delivered today.")}`;
+          out.innerHTML = `<div class="missing">Missing: ${missing} <a href="${wa}" target="_blank">WhatsApp</a> · <a href="${sms}">SMS</a></div>`;
         }
       };
+
       h.appendChild(ht);
       h.appendChild(gapBtn);
       wrapper.appendChild(h);
 
       const ul = document.createElement("ul");
-      items.forEach(i => {
-        const li = document.createElement("li");
-        li.textContent = i;
-        ul.appendChild(li);
-      });
+      items.forEach(name => ul.appendChild(itemRow(name, catalog?.[name])));
       wrapper.appendChild(ul);
 
       const gapRes = document.createElement("div");
@@ -106,27 +134,42 @@
       return wrapper;
     }
 
+    const goBtn = document.getElementById("goBtn");
+    const status = document.getElementById("status");
+    const results = document.getElementById("results");
+
     goBtn.onclick = async () => {
       try {
-        goBtn.disabled = true;
-        status.textContent = "Generating…";
-        results.innerHTML = "";
-
         const occasion = document.getElementById("occasion").value;
         const weather = document.getElementById("weather").value;
         const dare = document.getElementById("dare").checked;
 
-        const data = await postJSON("/api/outfits", { occasion, weather, dare });
-        const { outfit_A = [], outfit_B = [] } = data;
+        // lightweight telemetry for now
+        console.log("telemetry:generate", { occasion, weather, dare, ts: Date.now() });
 
-        const a = renderOutfit("Outfit A", outfit_A);
-        const b = renderOutfit("Outfit B", outfit_B);
+        goBtn.disabled = true;
+        status.textContent = "Styling your outfits…";
+        results.innerHTML = "";
+
+        const data = await postJSON("/api/outfits", { occasion, weather, dare });
+        const outfitA = toArray(data.outfit_A);
+        const outfitB = toArray(data.outfit_B);
+        const catalog = data.catalog || {};
+
+        if (outfitA.length === 0 && outfitB.length === 0) {
+          status.textContent = "No outfits available. Try adding more items or toggling Dare mode.";
+          return;
+        }
+
+        const a = renderOutfit("Outfit A", outfitA, catalog);
+        const b = renderOutfit("Outfit B", outfitB, catalog);
         results.appendChild(a);
         results.appendChild(b);
+
         status.textContent = "";
       } catch (e) {
         console.error(e);
-        status.textContent = "Something went wrong. Check your environment variables on Render.";
+        status.textContent = "Something went wrong. Please try again.";
       } finally {
         goBtn.disabled = false;
       }
