@@ -77,7 +77,7 @@ Return STRICT JSON only with keys: outfit_A, outfit_B, missing_items.`;
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",          // change to "gpt-4o" or "gpt-3.5-turbo" if needed
+        model: "gpt-4o-mini", // change to "gpt-4o" or "gpt-3.5-turbo" if your account requires
         messages: [{ role: "user", content: prompt }],
         temperature: 0.5
       })
@@ -88,24 +88,29 @@ Return STRICT JSON only with keys: outfit_A, outfit_B, missing_items.`;
     const jsonStr = raw.replace(/^```json\s*/i, "").replace(/```$/, "");
     const parsed = JSON.parse(jsonStr);
 
-    // ✅ Normalize anything (array/object/string) into arrays for the UI
+    // normalize arrays
     const toArray = (x) => {
       if (Array.isArray(x)) return x;
       if (x && typeof x === "object") return Object.values(x);
       if (typeof x === "string") return [x];
       return [];
     };
-
     const outfit_A = toArray(parsed.outfit_A).map(String);
     const outfit_B = toArray(parsed.outfit_B).map(String);
     const missing_items = toArray(parsed.missing_items).map(String);
 
-    res.json({ outfit_A, outfit_B, missing_items });
+    // catalog for thumbnails / meta
+    const catalog = Object.fromEntries(
+      closet.map(i => [i.item_name, { photoUrl: i.photoUrl, category: i.category, color: i.color }])
+    );
+
+    res.json({ outfit_A, outfit_B, missing_items, catalog });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err?.message || "Failed to generate outfits" });
   }
 });
+
 
 
 app.post("/api/gap", async (req, res) => {
@@ -122,4 +127,13 @@ app.post("/api/gap", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+app.get("/api/debug/closet", async (req, res) => {
+  try {
+    const items = await fetchCloset(500);
+    res.json({ count: items.length, sample: items.slice(0, 3) });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
 app.listen(PORT, () => console.log(`✅ Outfitted server running on http://localhost:${PORT}`));
