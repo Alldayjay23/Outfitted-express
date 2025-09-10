@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Outfitted — Closet + Concierge</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+           background:#FCF7F2; color:#141414; margin:0; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 24px; }
+    .card { background:#fff; border-radius:16px; padding:16px; box-shadow: 0 6px 20px rgba(0,0,0,0.06); margin-top:16px; }
+    button { background:#F26457; color:white; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:default; }
+    label { font-weight:600; font-size:14px; margin-top:10px; display:block; }
+    select, input[type=text] { width:100%; padding:10px; border:1px solid #ddd; border-radius:10px; }
+    .row { display:flex; gap:16px; }
+    .col { flex:1; }
+    .title { font-size:28px; font-weight:800; margin-bottom:8px; }
+    ul { margin:8px 0 0 18px; }
+    .missing { color:#c0392b; font-weight:600; }
+    .ok { color:#1e874b; font-weight:600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">Outfitted</div>
+    <div>When you don’t know what to wear — or don’t own it — this app solves both instantly.</div>
+
+    <div class="card">
+      <div class="row">
+        <div class="col">
+          <label>Occasion</label>
+          <select id="occasion">
+            <option>Work</option>
+            <option>Casual</option>
+            <option>Formal</option>
+            <option>Travel</option>
+          </select>
+        </div>
+        <div class="col">
+          <label>Weather</label>
+          <input id="weather" type="text" value="Mild/Sunny"/>
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+        <input type="checkbox" id="dare"/> Dare mode (push style slightly)
+      </label>
+      <button id="goBtn" style="margin-top:10px;">Generate Outfits</button>
+      <div id="status" style="margin-top:8px;"></div>
+    </div>
+
+    <div id="results"></div>
+  </div>
+
+  <script>
+    async function postJSON(url, body) {
+      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+      if (!r.ok) throw new Error("Request failed");
+      return r.json();
+    }
+
+    const goBtn = document.getElementById("goBtn");
+    const status = document.getElementById("status");
+    const results = document.getElementById("results");
+
+    function renderOutfit(title, items) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "card";
+      const h = document.createElement("div");
+      h.style.display = "flex";
+      h.style.justifyContent = "space-between";
+      h.style.alignItems = "center";
+      const ht = document.createElement("div");
+      ht.style.fontSize = "20px";
+      ht.style.fontWeight = "700";
+      ht.textContent = title;
+      const gapBtn = document.createElement("button");
+      gapBtn.textContent = "Gap Finder";
+      gapBtn.onclick = async () => {
+        const data = await postJSON("/api/gap", { outfit: items });
+        const out = wrapper.querySelector(".gapRes");
+        if (data.missing_items.length === 0) {
+          out.innerHTML = `<div class="ok">No missing items 🎉</div>`;
+        } else {
+          const msg = encodeURIComponent(`Need ${data.missing_items.join(", ")} delivered today.`);
+          out.innerHTML = `<div class="missing">Missing: ${data.missing_items.join(", ")} <a href="https://wa.me/?text=${msg}" target="_blank">Order Now</a></div>`;
+        }
+      };
+      h.appendChild(ht);
+      h.appendChild(gapBtn);
+      wrapper.appendChild(h);
+
+      const ul = document.createElement("ul");
+      items.forEach(i => {
+        const li = document.createElement("li");
+        li.textContent = i;
+        ul.appendChild(li);
+      });
+      wrapper.appendChild(ul);
+
+      const gapRes = document.createElement("div");
+      gapRes.className = "gapRes";
+      gapRes.style.marginTop = "8px";
+      wrapper.appendChild(gapRes);
+
+      return wrapper;
+    }
+
+    goBtn.onclick = async () => {
+      try {
+        goBtn.disabled = true;
+        status.textContent = "Generating…";
+        results.innerHTML = "";
+
+        const occasion = document.getElementById("occasion").value;
+        const weather = document.getElementById("weather").value;
+        const dare = document.getElementById("dare").checked;
+
+        const data = await postJSON("/api/outfits", { occasion, weather, dare });
+        const { outfit_A = [], outfit_B = [] } = data;
+
+        const a = renderOutfit("Outfit A", outfit_A);
+        const b = renderOutfit("Outfit B", outfit_B);
+        results.appendChild(a);
+        results.appendChild(b);
+        status.textContent = "";
+      } catch (e) {
+        console.error(e);
+        status.textContent = "Something went wrong. Check your environment variables on Render.";
+      } finally {
+        goBtn.disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
