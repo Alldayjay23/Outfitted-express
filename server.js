@@ -1,3 +1,59 @@
+// --- at the top of server.js (if not already) ---
+import Airtable from "airtable";
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// --- Airtable init (reuse if you already have it) ---
+const { AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME, AIRTABLE_VIEW } = process.env;
+if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE_NAME) {
+  console.warn("⚠️  Missing Airtable env vars (AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)");
+}
+const airtable = new Airtable({ apiKey: AIRTABLE_API_KEY });
+const base = airtable.base(AIRTABLE_BASE_ID);
+
+// --- GET /api/closet  -> returns [{ name, photo, category, color, status }] ---
+app.get("/api/closet", async (req, res) => {
+  try {
+    const records = await base(AIRTABLE_TABLE_NAME)
+      .select({
+        view: AIRTABLE_VIEW || "Grid view",
+        fields: ["Name", "Photo", "Category", "Color", "Status"],
+        pageSize: 100,
+      })
+      .all();
+
+    const rows = records.map((rec) => {
+      const f = rec.fields || {};
+      const photo = Array.isArray(f.Photo) && f.Photo.length > 0 ? f.Photo[0].url : undefined;
+      return {
+        id: rec.id,
+        name: f.Name || "",
+        photo,                          // <- full https URL we’ll render in the app
+        category: f.Category || "",
+        color: f.Color || "",
+        status: f.Status || "",         // e.g., Clean / Laundry
+      };
+    });
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Airtable /api/closet error:", err);
+    res.status(500).json({ error: "Failed to fetch closet" });
+  }
+});
+
+// ... keep your existing /api/outfits and /api/gap routes ...
+
+// --- start server (if not already present) ---
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 import 'dotenv/config';
 import express from "express";
 import cors from "cors";
