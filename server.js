@@ -3,13 +3,13 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import Airtable from 'airtable';
+import fetch from 'node-fetch';
 
-// ---------- ENV ----------
 const {
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID,
-  AIRTABLE_TABLE_CLOSET,     // e.g. "Clothing Items"
-  AIRTABLE_TABLE_OUTFITS,    // e.g. "Outfits"
+  AIRTABLE_TABLE_CLOSET,      // e.g. "Clothing Items"
+  AIRTABLE_TABLE_OUTFITS,     // e.g. "Outfits"
   OPENAI_API_KEY
 } = process.env;
 
@@ -21,63 +21,59 @@ if (!OPENAI_API_KEY) {
 }
 
 const TABLE_CLOSET = AIRTABLE_TABLE_CLOSET || 'Clothing Items';
-const TABLE_OUTFITS = AIRTABLE_TABLE_OUTFITS || 'Outfits';
+const TABLE_OUTFITS = AIRTABLE_TABLE_OUTFITS || null;
 
-// ---------- Airtable ----------
 const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 
 async function fetchCloset(limit = 200) {
-  try {
-    const records = await base(TABLE_CLOSET)
-      .select({ maxRecords: limit, view: 'Grid view' })
-      .all();
+  const records = await base(TABLE_CLOSET)
+    .select({ maxRecords: limit, view: 'Grid view' })
+    .all();
 
-    const items = records.map((r) => {
-      const f = r.fields || {};
-      return {
-        id: r.id,
-        item_name: f['Item Name'] || '',
-        category: f['Category'] || '',
-        color: f['Color'] || '',
-        photoUrl: Array.isArray(f['Photo']) && f['Photo'][0]?.url ? f['Photo'][0].url : undefined,
-        status: f['Status'] || 'Clean'
-      };
-    });
+  const items = records.map((r) => {
+    const f = r.fields || {};
+    return {
+      id: r.id,
+      item_name: f['Item Name'] || '',
+      category: f['Category'] || '',
+      color: f['Color'] || '',
+      photoUrl:
+        Array.isArray(f['Photo']) && f['Photo'][0]?.url ? f['Photo'][0].url : undefined,
+      status: f['Status'] || 'Clean'
+    };
+  });
 
-    // Only clean items
-    return items.filter((i) => String(i.status || '').toLowerCase() !== 'laundry');
-  } catch (err) {
-    console.error('fetchCloset error:', err);
-    throw err;
-  }
+  // Only clean items
+  return items.filter((i) => String(i.status).toLowerCase() !== 'laundry');
 }
 
-// ---------- Express ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.get('/api/debug/env', (req, res) => {
+  // safe peek to help debugging (doesn't leak secrets)
   res.json({
-    ok: true,
-    closetTable: TABLE_CLOSET,
-    outfitsTable: TABLE_OUTFITS || '(none)'
+    baseId: AIRTABLE_BASE_ID?.slice(0, 6) + '…',
+    tables: {
+      closet: TABLE_CLOSET,
+      outfits: TABLE_OUTFITS
+    }
   });
 });
 
-// Closet (thumbnails + meta)
 app.get('/api/closet', async (req, res) => {
   try {
     const items = await fetchCloset(200);
     res.json(items);
   } catch (err) {
-    console.error('Airtable /api/closet error:', err);
+    console.error('Airtable /api/closet error:', err?.statusCode, err?.error, err?.message);
     res.status(500).json({ error: 'Failed to fetch closet' });
   }
 });
 
-// Outfits (AI)
 app.post('/api/outfits', async (req, res) => {
   try {
     const { occasion = 'Work', weather = 'Mild/Sunny', dare = false } = req.body || {};
@@ -104,7 +100,6 @@ Task:
 - If an ideal outfit requires something not present, list it under "missing_items".${dareNote}
 Return STRICT JSON only with keys: outfit_A, outfit_B, missing_items.`;
 
-    // Use Node 18 global fetch (no node-fetch)
     const aiResp = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -112,98 +107,58 @@ Return STRICT JSON only with keys: outfit_A, outfit_B, missing_items.`;
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini', // change if needed
+        model: 'gpt-4o-mini',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.5
       })
     });
 
-    if (!aiResp.ok) {
-      const txt = await aiResp.text();
-      console.error('OpenAI error:', aiResp.status, txt);
-      return res.status(502).json({ error: 'OpenAI request failed' });
-    }
-
     const data = await aiResp.json();
     const raw = data?.choices?.[0]?.message?.content?.trim() || '{}';
     const jsonStr = raw.replace(/^```json\s*/i, '').replace(/```$/, '');
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonStr);
-    } catch {
-      console.error('OpenAI JSON parse failed. Raw content:', raw);
-      return res.status(502).json({ error: 'OpenAI returned invalid JSON' });
-    }
+    const parsed = JSON.parse(jsonStr);
 
-    const toArray = (x) => {
-      if (Array.isArray(x)) return x;
-      if (x && typeof x === 'object') return Object.values(x);
-      if (x == null) return [];
-      return String(x).split(',').map((s) => s.trim()).filter(Boolean);
-    };
-
+    const toArray = (x) => (Array.isArray(x) ? x : x ? [x].flat() : []);
     const outfit_A = toArray(parsed.outfit_A).map(String);
     const outfit_B = toArray(parsed.outfit_B).map(String);
     const missing_items = toArray(parsed.missing_items).map(String);
 
-    // catalog of thumbnails by item name
     const catalog = Object.fromEntries(
       closet.map((i) => [i.item_name, { photoUrl: i.photoUrl, category: i.category, color: i.color }])
     );
 
     res.json({ outfit_A, outfit_B, missing_items, catalog });
   } catch (err) {
-    console.error('Outfits error:', err);
+    console.error('Outfits error:', err?.statusCode, err?.error, err?.message);
     res.status(500).json({ error: err?.message || 'Failed to generate outfits' });
   }
 });
 
-// Gap check
 app.post('/api/gap', async (req, res) => {
   try {
     const { outfit = [] } = req.body || {};
     const closet = await fetchCloset(500);
-    const owned = new Set(closet.map((i) => (i.item_name || '').toLowerCase().trim()));
-    const missing = (Array.isArray(outfit) ? outfit : [])
-      .filter((name) => !owned.has(String(name).toLowerCase().trim()));
+    const owned = new Set(closet.map((i) => i.item_name.toLowerCase().trim()));
+    const missing = outfit.filter((name) => !owned.has(String(name).toLowerCase().trim()));
     res.json({ missing_items: missing });
   } catch (err) {
-    console.error('Gap error:', err);
+    console.error('Gap error:', err?.statusCode, err?.error, err?.message);
     res.status(500).json({ error: err?.message || 'Failed gap check' });
   }
 });
 
-// Debug helper
-app.get('/api/debug/closet', async (req, res) => {
-  try {
-    const items = await fetchCloset(500);
-    res.json({ count: items.length, sample: items.slice(0, 3) });
-  } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-// Saved outfits archive (Airtable)
+// ---- Outfits archive ----
 app.get('/api/outfit-archive', async (req, res) => {
   try {
-    if (!TABLE_OUTFITS) {
-      console.warn('No AIRTABLE_TABLE_OUTFITS set; returning empty archive');
-      return res.json({ outfits: [], catalog: {} });
-    }
+    if (!TABLE_OUTFITS) return res.json({ outfits: [], catalog: {} });
 
-    const recs = await base(TABLE_OUTFITS)
-      .select({ view: 'Grid view', pageSize: 100 })
-      .all();
+    const recs = await base(TABLE_OUTFITS).select({ view: 'Grid view', pageSize: 100 }).all();
 
-    // Build catalog from closet for thumbnails
     const closet = await fetchCloset(500);
     const catalog = Object.fromEntries(
       closet
         .filter((i) => i.item_name)
-        .map((i) => [
-          i.item_name,
-          { photoUrl: i.photoUrl, category: i.category, color: i.color },
-        ])
+        .map((i) => [i.item_name, { photoUrl: i.photoUrl, category: i.category, color: i.color }])
     );
 
     const outfits = recs.map((r) => {
@@ -217,21 +172,31 @@ app.get('/api/outfit-archive', async (req, res) => {
         Array.isArray(f.Photo) && f.Photo[0]?.url ? f.Photo[0].url : undefined;
 
       return {
-        title: f.Title || '',
+        title: f.Title || r.get('Title') || '',
         items,
-        photo,
+        photo
       };
     });
 
     res.json({ outfits, catalog });
   } catch (e) {
-    console.error('archive error', e);
+    console.error('archive error', e?.statusCode, e?.error, e?.message);
+    // Add a friendlier message on common cases
+    if (e?.statusCode === 403) {
+      return res.status(403).json({
+        error:
+          'Airtable denied access (403). Check your PAT scopes (data.records:read) and that it has access to this base, and verify AIRTABLE_BASE_ID points to the base that contains the "Outfits" table.'
+      });
+    }
+    if (e?.statusCode === 404) {
+      return res.status(404).json({
+        error:
+          'Table not found. Confirm AIRTABLE_TABLE_OUTFITS matches the table name exactly in Airtable.'
+      });
+    }
     res.status(500).json({ error: 'Failed to fetch outfits archive' });
   }
 });
 
-// Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`✅ Outfitted server listening on http://localhost:${PORT}`)
-);
+app.listen(PORT, () => console.log(`✅ Outfitted server listening on http://localhost:${PORT}`));
