@@ -152,6 +152,51 @@ app.get('/api/debug/closet', async (req, res) => {
   }
 });
 
+// --- Saved outfits archive from Airtable ---
+// requires env AIRTABLE_TABLE_OUTFITS (e.g., "Outfits")
+app.get("/api/outfit-archive", async (req, res) => {
+  try {
+    const tblName = process.env.AIRTABLE_TABLE_OUTFITS;
+    if (!tblName) return res.json({ outfits: [] });
+
+    const recs = await base(tblName).select({ view: "Grid view", pageSize: 100 }).all();
+
+    // Build closet map (name -> photo) to help client render thumbnails if you want
+    const closet = await fetchCloset(500);
+    const catalog = Object.fromEntries(
+      closet
+        .filter((i) => i.item_name)
+        .map((i) => [
+          i.item_name,
+          { photoUrl: i.photoUrl, category: i.category, color: i.color },
+        ])
+    );
+
+    const outfits = recs.map((r) => {
+      const f = r.fields || {};
+      let items = [];
+      if (Array.isArray(f.Items)) items = f.Items; // if you used multiselect/array
+      else if (typeof f.Items === "string")
+        items = f.Items.split(",").map((s) => s.trim()).filter(Boolean);
+
+      const photo =
+        Array.isArray(f.Photo) && f.Photo[0]?.url ? f.Photo[0].url : undefined;
+
+      return {
+        title: f.Title || r.get("Title") || "",
+        items,
+        photo,
+      };
+    });
+
+    res.json({ outfits, catalog });
+  } catch (e) {
+    console.error("archive error", e);
+    res.status(500).json({ error: "Failed to fetch outfits archive" });
+  }
+});
+
+
 // Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Outfitted server listening on http://localhost:${PORT}`));
