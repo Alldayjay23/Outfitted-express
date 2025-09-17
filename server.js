@@ -292,8 +292,14 @@ app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
 /* eslint-disable no-unused-vars */
 app.use((err, req, res, next) => {
   const status = err.status || 500;
-  req.log.error({ err, msg: err.message, status, path: req.path });
-  res.status(status).json({ error: { code: err.code || 'INTERNAL_ERROR', message: err.message || 'Unexpected server error', requestId: req.id } });
+  const payload = {
+    code: err.code || 'INTERNAL_ERROR',
+    message: err.message || 'Unexpected server error',
+    details: err.details,          // <-- surfaces Airtable/OpenAI details
+    requestId: req.id
+  };
+  req.log.error({ err, status, path: req.path, requestId: req.id });
+  res.status(status).json({ error: payload });
 });
 /* eslint-enable no-unused-vars */
 
