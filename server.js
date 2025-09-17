@@ -173,51 +173,51 @@ ${JSON.stringify(user, null, 2)}
   };
 
   // ---- Try Responses API first
-  try {
-    const r = await openai.responses.create({
-      model,
-      input: [
-        { role: 'system', content: system },
-        { role: 'user', content: prompt }
-      ],
-      text: { format: 'json' } 
-    });
-    const text = r.output_text || (r.output?.[0]?.content?.[0]?.text ?? '');
-    const parsed = extractJson(text);
-    if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
-    if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
-    return parsed.outfits;
-  } catch (e1) {
-    // If Responses is blocked/unauthorized, fall back to Chat Completions
-    if (e1?.status === 403 || /not authorized/i.test(e1?.message || '')) {
-      try {
-        const resp = await openai.chat.completions.create({
-          model,
-          temperature: 0.2,
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: prompt }
-          ]
-        });
-        const content = resp.choices?.[0]?.message?.content || '';
-        const parsed = extractJson(content);
-        if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
-        if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
-        return parsed.outfits;
-      } catch (e2) {
-        const msg = e2?.response?.data?.error?.message || e2.message || 'OpenAI error';
-        const status = e2?.status || e2?.response?.status || 502;
-        throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e2?.response?.data });
-      }
+  // ---- Try Responses API first (no text.format; we'll parse JSON ourselves)
+try {
+  const r = await openai.responses.create({
+    model,
+    input: [
+      { role: 'system', content: system },
+      { role: 'user',  content: prompt }
+    ]
+  });
+
+  // Works across SDK versions:
+  const text = r.output_text || (r.output?.[0]?.content?.[0]?.text ?? '');
+  const parsed = extractJson(text);
+  if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
+  if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
+  return parsed.outfits;
+} catch (e1) {
+  // If Responses is blocked/unauthorized, fall back to Chat Completions
+  if (e1?.status === 403 || /not authorized/i.test(e1?.message || '')) {
+    try {
+      const resp = await openai.chat.completions.create({
+        model,
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: prompt }
+        ]
+      });
+      const content = resp.choices?.[0]?.message?.content || '';
+      const parsed = extractJson(content);
+      if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
+      if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
+      return parsed.outfits;
+    } catch (e2) {
+      const msg = e2?.response?.data?.error?.message || e2.message || 'OpenAI error';
+      const status = e2?.status || e2?.response?.status || 502;
+      throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e2?.response?.data });
     }
-    const msg = e1?.response?.data?.error?.message || e1.message || 'OpenAI error';
-    const status = e1?.status || e1?.response?.status || 502;
-    throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e1?.response?.data });
   }
+  const msg = e1?.response?.data?.error?.message || e1.message || 'OpenAI error';
+  const status = e1?.status || e1?.response?.status || 502;
+  throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e1?.response?.data });
+}
 }
 // ==== generateOutfitsWithAI (END) ====
-
-
 
 function buildOutfitFields(outfit, items, meta) {
   const { occasion = '', style = '', weather = '' } = meta;
