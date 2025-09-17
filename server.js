@@ -22,6 +22,7 @@ const {
   AIRTABLE_TABLE_OUTFITS = 'Outfits',
   AIRTABLE_TABLE_ORDERS = 'Orders',
   OPENAI_API_KEY,
+  OPENAI_MODEL = 'gpt-4o-mini',
   API_KEY,
   ALLOWED_ORIGINS = '',
 
@@ -43,15 +44,17 @@ const {
   OUTFITS_OCCASION_FIELD = 'Occasion',
   OUTFITS_STYLE_FIELD = 'Style',
   OUTFITS_WEATHER_FIELD = 'Weather',
-  OUTFITS_PHOTO_AS_ATTACHMENT = 'true'
+  OUTFITS_PHOTO_AS_ATTACHMENT = 'true',
+
+  // Optional: bypass OpenAI for debugging
+  SKIP_OPENAI = 'false'
 } = process.env;
 
 if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
-if (!OPENAI_API_KEY) { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
+if (!OPENAI_API_KEY && SKIP_OPENAI !== 'true') { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
 if (!API_KEY) { console.error('⚠️ Missing API_KEY'); process.exit(1); }
 
-// derived flags (must be outside the destructuring)
-const CLOSET_PHOTO_IS_ATTACHMENT = String(CLOSET_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
+const CLOSET_PHOTO_IS_ATTACHMENT  = String(CLOSET_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
 const OUTFITS_PHOTO_IS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
 
 // ---------- CORE ----------
@@ -89,10 +92,22 @@ function requireApiKey(req, res, next) {
 
 // ---------- CLIENTS ----------
 const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
-const tbCloset = base(AIRTABLE_TABLE_CLOSET);
+const tbCloset  = base(AIRTABLE_TABLE_CLOSET);
 const tbOutfits = base(AIRTABLE_TABLE_OUTFITS);
-const tbOrders = base(AIRTABLE_TABLE_ORDERS);
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const tbOrders  = base(AIRTABLE_TABLE_ORDERS);
+const openai    = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// ---------- UTILS ----------
+function readField(obj, key, fallbacks = []) {
+  if (obj[key] != null) return obj[key];
+  for (const fb of fallbacks) if (obj[fb] != null) return obj[fb];
+  return undefined;
+}
+function firstUrl(val) {
+  if (Array.isArray(val) && val[0]?.url) return val[0].url; // attachment
+  if (typeof val === 'string') return val;                   // plain URL
+  return undefined;
+}
 
 // ---------- SCHEMAS ----------
 const OutfitSuggestSchema = z.object({
@@ -101,51 +116,33 @@ const OutfitSuggestSchema = z.object({
   weather: z.string().optional(),
   style: z.string().optional(),
   itemIds: z.array(z.string()).nonempty('Provide itemIds from Clothing Items'),
-  topK: z.number().int().min(1).max(5).default(3)
+  topK: z.number().int().min(1).max(5).default(1)
 });
-
 const CreateOrderSchema = z.object({
   userId: z.string().min(1),
   outfitId: z.string().min(1),
-  fulfillment: z.enum(['delivery', 'pickup', 'stylist']).default('delivery'),
+  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
   note: z.string().max(2000).optional()
 });
 
-// ---------- HELPERS ----------
-function readField(obj, key, fallbacks = []) {
-  if (obj[key] != null) return obj[key];
-  for (const fb of fallbacks) if (obj[fb] != null) return obj[fb];
-  return undefined;
-}
-
-function firstUrl(val) {
-  if (Array.isArray(val) && val[0]?.url) return val[0].url; // attachment
-  if (typeof val === 'string') return val;                   // plain URL
-  return undefined;
-}
-
-async function fetchClosetItemsByIds(ids) {
-  const out = [];
-  for (let i = 0; i < ids.length; i += 10) {
-    const batch = ids.slice(i, i + 10);
-    const formula = `OR(${batch.map(id => `RECORD_ID() = '${id}'`).join(', ')})`;
-    const page = await tbCloset.select({ filterByFormula: formula }).all();
-    out.push(...page.map(r => ({ id: r.id, fields: r.fields })));
-  }
-  return out;
-}
-
-// ==== generateOutfitsWithAI (BEGIN) ====
+// ---------- OPENAI ----------
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  if (String(SKIP_OPENAI).toLowerCase() === 'true') {
+    // Deterministic stub for debugging
+    return [{
+      name: `${style || 'Look'} for ${occasion}`,
+      items: items.map(i => i.id),
+      reasoning: 'Debug: SKIP_OPENAI enabled.',
+      palette: ['neutral'],
+      preview: ''
+    }];
+  }
 
   const system = `You are a fashion stylist AI. Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["string"],"reasoning":"string","palette":["string"],"preview":""}]}`;
 
   const user = {
-    occasion,
-    weather: weather || '',
-    style: style || '',
+    occasion, weather: weather || '', style: style || '',
     items: items.map(i => ({
       id: i.id,
       name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || 'Unknown',
@@ -172,37 +169,38 @@ ${JSON.stringify(user, null, 2)}
     try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
   };
 
-  // ---- Try Responses API first
-  // ---- Try Responses API first (no text.format; we'll parse JSON ourselves)
-try {
-  const r = await openai.responses.create({
-    model,
-    input: [
-      { role: 'system', content: system },
-      { role: 'user',  content: prompt }
-    ]
-  });
+  // ---- Try Responses API first (no text.format; we parse ourselves)
+  try {
+    const r = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: [
+        { role: 'system', content: system },
+        { role: 'user',  content: prompt }
+      ]
+    });
 
-  // Works across SDK versions:
-  const text = r.output_text || (r.output?.[0]?.content?.[0]?.text ?? '');
-  const parsed = extractJson(text);
-  if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
-  if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
-  return parsed.outfits;
-} catch (e1) {
-  // If Responses is blocked/unauthorized, fall back to Chat Completions
-  if (e1?.status === 403 || /not authorized/i.test(e1?.message || '')) {
+    const text =
+      r.output_text ||
+      (Array.isArray(r.output) ? r.output.flatMap(o => (o?.content || []).map(c => c?.text || '')).join('') : '') ||
+      '';
+
+    const parsed = extractJson(text);
+    if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
+    if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
+    return parsed.outfits;
+  } catch (e1) {
+    // Fall back to Chat Completions (if allowed)
     try {
       const resp = await openai.chat.completions.create({
-        model,
+        model: OPENAI_MODEL,
         temperature: 0.2,
         messages: [
           { role: 'system', content: system },
-          { role: 'user', content: prompt }
+          { role: 'user',   content: prompt }
         ]
       });
       const content = resp.choices?.[0]?.message?.content || '';
-      const parsed = extractJson(content);
+      const parsed  = extractJson(content);
       if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
       if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
       return parsed.outfits;
@@ -212,42 +210,15 @@ try {
       throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e2?.response?.data });
     }
   }
-  const msg = e1?.response?.data?.error?.message || e1.message || 'OpenAI error';
-  const status = e1?.status || e1?.response?.status || 502;
-  throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e1?.response?.data });
-}
-}
-// ==== generateOutfitsWithAI (END) ====
-
-function buildOutfitFields(outfit, items, meta) {
-  const { occasion = '', style = '', weather = '' } = meta;
-  const fields = {
-    [OUTFITS_NAME_FIELD]: outfit.name,
-    [OUTFITS_ITEMS_FIELD]: items.map(i => i.id), // Link field
-    [OUTFITS_OCCASION_FIELD]: occasion,
-    [OUTFITS_STYLE_FIELD]: style,
-    [OUTFITS_WEATHER_FIELD]: weather,
-    [OUTFITS_REASON_FIELD]: outfit.reasoning || '',
-    [OUTFITS_PALETTE_FIELD]: Array.isArray(outfit.palette) ? outfit.palette.join(', ') : ''
-  };
-
-  if (outfit.preview) {
-    if (OUTFITS_PHOTO_IS_ATTACHMENT) {
-      fields[OUTFITS_PHOTO_FIELD] = [{ url: outfit.preview }];
-    } else {
-      fields[OUTFITS_PHOTO_FIELD] = outfit.preview;
-    }
-  }
-  return fields;
 }
 
 // ---------- ROUTES ----------
-app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
-
-// List/search clothing items
 app.get('/', (req, res) => {
   res.type('text').send('Outfitted API is running. Try GET /healthz');
 });
+app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
+
+// List/search clothing items
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
     const { q, limit = 50 } = req.query;
@@ -279,22 +250,45 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     if (!parsed.success) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
 
     const { occasion, weather, style, itemIds, topK } = parsed.data;
-    const items = await fetchClosetItemsByIds(itemIds);
+    const items = await (async function fetchByIds(ids) {
+      const out = [];
+      for (let i = 0; i < ids.length; i += 10) {
+        const batch = ids.slice(i, i + 10);
+        const formula = `OR(${batch.map(id => `RECORD_ID() = '${id}'`).join(', ')})`;
+        const page = await tbCloset.select({ filterByFormula: formula }).all();
+        out.push(...page.map(r => ({ id: r.id, fields: r.fields })));
+      }
+      return out;
+    })(itemIds);
+
     if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
     const outfits = await generateOutfitsWithAI({ items, occasion, weather, style, topK });
 
     const created = [];
     for (const o of outfits) {
-      const fields = buildOutfitFields(o, items, { occasion, style, weather });
+      const fields = {
+        [OUTFITS_NAME_FIELD]: o.name,
+        [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
+        [OUTFITS_OCCASION_FIELD]: occasion,
+        [OUTFITS_STYLE_FIELD]: style || '',
+        [OUTFITS_WEATHER_FIELD]: weather || '',
+        [OUTFITS_REASON_FIELD]: o.reasoning || '',
+        [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : ''
+      };
+      if (o.preview) {
+        if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
+        else fields[OUTFITS_PHOTO_FIELD] = o.preview;
+      }
       const rec = await tbOutfits.create([{ fields }]);
       created.push({ id: rec[0].id, fields });
     }
+
     res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields })) });
   } catch (err) { next(err); }
 });
 
-// Create order
+// Orders
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
     const parsed = CreateOrderSchema.safeParse(req.body);
@@ -309,8 +303,6 @@ app.post('/api/orders', requireApiKey, async (req, res, next) => {
     res.status(201).json({ data: { id: recs[0].id, ...fields } });
   } catch (err) { next(err); }
 });
-
-// Get order
 app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
   try {
     const rec = await tbOrders.find(req.params.id);
@@ -321,14 +313,14 @@ app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
   }
 });
 
-// ---------- ERRORS ----------
+// ---------- ERROR HANDLER ----------
 /* eslint-disable no-unused-vars */
 app.use((err, req, res, next) => {
   const status = err.status || 500;
   const payload = {
     code: err.code || 'INTERNAL_ERROR',
     message: err.message || 'Unexpected server error',
-    details: err.details,          // <-- surfaces Airtable/OpenAI details
+    details: err.details,
     requestId: req.id
   };
   req.log.error({ err, status, path: req.path, requestId: req.id });
