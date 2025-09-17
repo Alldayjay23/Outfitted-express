@@ -18,37 +18,46 @@ const {
   LOG_LEVEL = 'info',
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID,
-  AIRTABLE_TABLE_CLOSET = 'Closet Items',
-  AIRTABLE_TABLE_OUTFITS = 'Outfit Archives',
+  AIRTABLE_TABLE_CLOSET = 'Clothing Items',
+  AIRTABLE_TABLE_OUTFITS = 'Outfits',
   AIRTABLE_TABLE_ORDERS = 'Orders',
   OPENAI_API_KEY,
-  API_KEY, // simple server-side auth for mobile
-  ALLOWED_ORIGINS = ''
+  API_KEY,
+  ALLOWED_ORIGINS = '',
+
+  // Field maps (Airtable is case-sensitive)
+  CLOSET_NAME_FIELD = 'Title',
+  CLOSET_CATEGORY_FIELD = 'Category',
+  CLOSET_BRAND_FIELD = 'Brand',
+  CLOSET_COLOR_FIELD = 'Colors',
+  CLOSET_IMAGEURL_FIELD = 'Image URL',
+
+  OUTFITS_NAME_FIELD = 'Title',
+  OUTFITS_ITEMS_FIELD = 'Items',
+  OUTFITS_PHOTO_FIELD = 'Photo',
+  OUTFITS_STATUS_FIELD = 'Status',
+  OUTFITS_REASON_FIELD = 'AI Reasoning',
+  OUTFITS_PALETTE_FIELD = 'Palette',
+  OUTFITS_OCCASION_FIELD = 'Occasion',
+  OUTFITS_STYLE_FIELD = 'Style',
+  OUTFITS_WEATHER_FIELD = 'Weather',
+  OUTFITS_PHOTO_AS_ATTACHMENT = 'false'
 } = process.env;
 
-if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
-  console.error('⚠️ Missing Airtable credentials');
-  process.exit(1);
-}
-if (!OPENAI_API_KEY) {
-  console.error('⚠️ Missing OPENAI_API_KEY');
-  process.exit(1);
-}
-if (!API_KEY) {
-  console.error('⚠️ Missing API_KEY for client auth');
-  process.exit(1);
-}
+if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
+if (!OPENAI_API_KEY) { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
+if (!API_KEY) { console.error('⚠️ Missing API_KEY'); process.exit(1); }
+
+const PHOTO_AS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
 
 // ---------- CORE ----------
 const app = express();
 const allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
-    // allow mobile schemes or same-origin/Render health
     if (!origin || allowed.includes(origin) || origin?.startsWith('exp://')) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
-  credentials: false
 }));
 app.use(helmet());
 app.use(compression());
@@ -57,7 +66,7 @@ app.use(express.urlencoded({ extended: false }));
 
 const logger = pinoHttp({
   level: LOG_LEVEL,
-  genReqId: (req, res) => req.headers['x-request-id'] || uuidv4(),
+  genReqId: (req) => req.headers['x-request-id'] || uuidv4(),
   redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers'],
 });
 app.use(logger);
@@ -65,10 +74,9 @@ app.use(logger);
 const limiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
 app.use('/api/', limiter);
 
-// ---------- AUTH (simple) ----------
+// ---------- AUTH ----------
 function requireApiKey(req, res, next) {
-  const key = req.header('x-api-key');
-  if (!key || key !== API_KEY) {
+  if (req.header('x-api-key') !== API_KEY) {
     req.log.warn({ msg: 'Unauthorized', path: req.path });
     return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid API key' } });
   }
@@ -82,14 +90,13 @@ const tbOutfits = base(AIRTABLE_TABLE_OUTFITS);
 const tbOrders = base(AIRTABLE_TABLE_ORDERS);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ---------- UTILS ----------
+// ---------- SCHEMAS ----------
 const OutfitSuggestSchema = z.object({
   userId: z.string().optional(),
   occasion: z.string().min(1),
-  weather: z.string().optional(),        // e.g., "75F, sunny"
-  style: z.string().optional(),          // e.g., "smart casual"
-  itemIds: z.array(z.string()).optional(), // Airtable record IDs from Closet Items
-  imageUrls: z.array(z.string().url()).optional(), // if you pass direct images
+  weather: z.string().optional(),
+  style: z.string().optional(),
+  itemIds: z.array(z.string()).nonempty('Provide itemIds from Clothing Items'),
   topK: z.number().int().min(1).max(5).default(3)
 });
 
@@ -100,186 +107,169 @@ const CreateOrderSchema = z.object({
   note: z.string().max(2000).optional()
 });
 
-// helper: fetch closet items by IDs
-async function fetchClosetItemsByIds(ids = []) {
-  if (!ids?.length) return [];
-  const chunks = [];
-  // Airtable allows up to 10 id filters per formula comfortably
+// ---------- HELPERS ----------
+async function fetchClosetItemsByIds(ids) {
+  const out = [];
   for (let i = 0; i < ids.length; i += 10) {
     const batch = ids.slice(i, i + 10);
     const formula = `OR(${batch.map(id => `RECORD_ID() = '${id}'`).join(', ')})`;
     const page = await tbCloset.select({ filterByFormula: formula }).all();
-    chunks.push(...page);
+    out.push(...page.map(r => ({ id: r.id, fields: r.fields })));
   }
-  return chunks.map(r => ({ id: r.id, fields: r.fields }));
+  return out;
 }
 
-// helper: minimal OpenAI call (JSON output contract)
+function readField(obj, key, fallbacks = []) {
+  if (obj[key] != null) return obj[key];
+  for (const fb of fallbacks) if (obj[fb] != null) return obj[fb];
+  return undefined;
+}
+
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
-  const system = `You are a fashion stylist AI. Always return strictly valid JSON matching this schema:
-{
-  "outfits": [
-    {
-      "name": "string",
-      "items": ["Closet Item Name or ID"],
-      "reasoning": "short explanation",
-      "palette": ["color1","color2"],
-      "preview": "optional image url or empty string"
-    }
-  ]
-}`;
+  const system = `You are a fashion stylist AI. Return ONLY valid JSON:
+{"outfits":[{"name":"string","items":["string"],"reasoning":"string","palette":["string"],"preview":""}]}`;
+
   const user = {
-    occasion,
-    weather: weather || '',
-    style: style || '',
+    occasion, weather: weather || '', style: style || '',
     items: items.map(i => ({
       id: i.id,
-      name: i.fields.Name || i.fields.Item || 'Unknown',
-      category: i.fields.Category || '',
-      color: i.fields.Color || i.fields.Colors || '',
-      brand: i.fields.Brand || '',
+      name: readField(i.fields, CLOSET_NAME_FIELD, ['Name','Title','Item']) || 'Unknown',
+      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
+      color: readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
+      brand: readField(i.fields, CLOSET_BRAND_FIELD, ['Brand']) || '',
     })),
     count: topK
   };
 
-  // Ask for compact JSON
-  const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
-Return ONLY JSON. No prose.
-
-Input:
-${JSON.stringify(user, null, 2)}
-`;
-
-  // Use Chat Completions for broad compatibility
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0.2,
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: prompt }
+      { role: 'user', content: `Make ${topK} outfit suggestion(s). Return ONLY JSON.\n${JSON.stringify(user, null, 2)}` }
     ],
     response_format: { type: 'json_object' }
   });
 
-  const content = resp.choices?.[0]?.message?.content ?? '{}';
   let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch (e) {
-    throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 500) });
-  }
-  if (!parsed?.outfits?.length) {
-    throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
-  }
+  try { parsed = JSON.parse(resp.choices?.[0]?.message?.content ?? '{}'); }
+  catch { throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502 }); }
+  if (!parsed?.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
   return parsed.outfits;
+}
+
+function buildOutfitFields(outfit, items, meta) {
+  const {
+    occasion = '', style = '', weather = ''
+  } = meta;
+
+  const fields = {
+    [OUTFITS_NAME_FIELD]: outfit.name,
+    [OUTFITS_ITEMS_FIELD]: items.map(i => i.id), // must be a Link field
+    [OUTFITS_OCCASION_FIELD]: occasion,
+    [OUTFITS_STYLE_FIELD]: style,
+    [OUTFITS_WEATHER_FIELD]: weather,
+    [OUTFITS_REASON_FIELD]: outfit.reasoning || '',
+    [OUTFITS_PALETTE_FIELD]: Array.isArray(outfit.palette) ? outfit.palette.join(', ') : ''
+  };
+
+  if (outfit.preview) {
+    if (PHOTO_AS_ATTACHMENT) {
+      fields[OUTFITS_PHOTO_FIELD] = [{ url: outfit.preview }];
+    } else {
+      fields[OUTFITS_PHOTO_FIELD] = outfit.preview;
+    }
+  }
+  return fields;
 }
 
 // ---------- ROUTES ----------
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
 
-// Suggest outfits (replaces Google Form logic)
+// List/search closet items (helps the app find IDs to send)
+app.get('/api/closet', requireApiKey, async (req, res, next) => {
+  try {
+    const { q, limit = 50 } = req.query;
+    const cfg = { pageSize: Math.min(Number(limit) || 50, 100) };
+    if (q) cfg.filterByFormula = `FIND(LOWER("${String(q).toLowerCase()}"), LOWER({${CLOSET_NAME_FIELD}}))`;
+    const records = await tbCloset.select(cfg).all();
+    const data = records.map(r => ({
+      id: r.id,
+      name: readField(r.fields, CLOSET_NAME_FIELD, ['Name','Title','Item']),
+      category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+      brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+      color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+      imageUrl: readField(r.fields, CLOSET_IMAGEURL_FIELD, ['Image URL']),
+    }));
+    res.json({ data });
+  } catch (err) { next(err); }
+});
+
+// Suggest outfits
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   try {
     const parsed = OutfitSuggestSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
-    }
-    const { occasion, weather, style, itemIds = [], topK } = parsed.data;
+    if (!parsed.success) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
 
+    const { occasion, weather, style, itemIds, topK } = parsed.data;
     const items = await fetchClosetItemsByIds(itemIds);
-    if (!items.length) {
-      return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide one or more valid itemIds.' } });
-    }
+    if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
     const outfits = await generateOutfitsWithAI({ items, occasion, weather, style, topK });
 
-    // Persist top suggestion(s) to Airtable
     const created = [];
     for (const o of outfits) {
-      const fields = {
-        Name: o.name,
-        Occasion: occasion,
-        Style: style || '',
-        Weather: weather || '',
-        'AI Reasoning': o.reasoning || '',
-        'Palette': Array.isArray(o.palette) ? o.palette.join(', ') : '',
-        'Preview Image URL': o.preview || '',
-        Items: items.map(i => i.id) // link to Closet Items
-      };
+      const fields = buildOutfitFields(o, items, { occasion, style, weather });
       const rec = await tbOutfits.create([{ fields }]);
       created.push({ id: rec[0].id, fields });
     }
-
-    return res.status(201).json({
-      data: created.map(c => ({ id: c.id, ...c.fields }))
-    });
-  } catch (err) {
-    next(err);
-  }
+    res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields })) });
+  } catch (err) { next(err); }
 });
 
-// Create an order from an outfit ("Order Now" button)
+// Create order
+const CreateOrder = z.object({
+  userId: z.string().min(1),
+  outfitId: z.string().min(1),
+  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
+  note: z.string().optional()
+});
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const parsed = CreateOrderSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
-    }
-    const { userId, outfitId, fulfillment, note } = parsed.data;
+    const parsed = CreateOrder.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
 
-    // Validate outfit exists
+    const { userId, outfitId, fulfillment, note } = parsed.data;
     const outfit = await tbOutfits.find(outfitId).catch(() => null);
     if (!outfit) return res.status(404).json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
 
-    // Create order
-    const fields = {
-      'User Id': userId,
-      Outfit: [outfitId],             // link to Outfit Archives
-      Status: 'pending',              // Single select
-      Fulfillment: fulfillment,       // Single select
-      Note: note || ''
-    };
+    const fields = { 'User Id': userId, Outfit: [outfitId], Status: 'pending', Fulfillment: fulfillment, Note: note || '' };
     const recs = await tbOrders.create([{ fields }]);
-    const rec = recs[0];
-
-    return res.status(201).json({
-      data: { id: rec.id, ...fields }
-    });
-  } catch (err) {
-    next(err);
-  }
+    res.status(201).json({ data: { id: recs[0].id, ...fields } });
+  } catch (err) { next(err); }
 });
 
-// Get order by id
+// Get order
 app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
   try {
     const rec = await tbOrders.find(req.params.id);
-    return res.status(200).json({ data: { id: rec.id, fields: rec.fields } });
+    res.json({ data: { id: rec.id, fields: rec.fields } });
   } catch (err) {
-    if (String(err).includes('NOT_FOUND')) {
-      return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
-    }
+    if (String(err).includes('NOT_FOUND')) return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
     next(err);
   }
 });
 
-// ---------- ERROR HANDLER ----------
+// ---------- ERRORS ----------
 /* eslint-disable no-unused-vars */
 app.use((err, req, res, next) => {
   const status = err.status || 500;
   req.log.error({ err, msg: err.message, status, path: req.path });
-  return res.status(status).json({
-    error: {
-      code: err.code || 'INTERNAL_ERROR',
-      message: err.message || 'Unexpected server error',
-      requestId: req.id
-    }
-  });
+  res.status(status).json({ error: { code: err.code || 'INTERNAL_ERROR', message: err.message || 'Unexpected server error', requestId: req.id } });
 });
 /* eslint-enable no-unused-vars */
 
 // ---------- BOOT ----------
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`✅ Outfitted API listening on ${PORT} (${NODE_ENV})`);
+  console.log(`✅ Outfitted API on ${PORT} (${NODE_ENV})`);
 });
