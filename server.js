@@ -180,7 +180,7 @@ ${JSON.stringify(user, null, 2)}
         { role: 'system', content: system },
         { role: 'user', content: prompt }
       ],
-      response_format: { type: 'json_object' }
+      text: { format: 'json_object' }
     });
     const text = r.output_text || (r.output?.[0]?.content?.[0]?.text ?? '');
     const parsed = extractJson(text);
