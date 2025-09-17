@@ -25,16 +25,15 @@ const {
   API_KEY,
   ALLOWED_ORIGINS = '',
 
-  // Field maps (Airtable is case-sensitive)
-  CLOSET_NAME_FIELD = 'Title',
+  // Clothing Items fields
+  CLOSET_NAME_FIELD = 'Item Name',
   CLOSET_CATEGORY_FIELD = 'Category',
   CLOSET_BRAND_FIELD = 'Brand',
-  CLOSET_COLOR_FIELD = 'Colors',
-  CLOSET_IMAGEURL_FIELD = 'Image URL',
+  CLOSET_COLOR_FIELD = 'Color',
   CLOSET_PHOTO_FIELD = 'Photo',
   CLOSET_PHOTO_AS_ATTACHMENT = 'true',
-  const CLOSET_PHOTO_IS_ATTACHMENT = String(CLOSET_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
 
+  // Outfits fields
   OUTFITS_NAME_FIELD = 'Title',
   OUTFITS_ITEMS_FIELD = 'Items',
   OUTFITS_PHOTO_FIELD = 'Photo',
@@ -51,7 +50,9 @@ if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airt
 if (!OPENAI_API_KEY) { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
 if (!API_KEY) { console.error('⚠️ Missing API_KEY'); process.exit(1); }
 
-const PHOTO_AS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
+// derived flags (must be outside the destructuring)
+const CLOSET_PHOTO_IS_ATTACHMENT = String(CLOSET_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
+const OUTFITS_PHOTO_IS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
 
 // ---------- CORE ----------
 const app = express();
@@ -111,8 +112,14 @@ const CreateOrderSchema = z.object({
 });
 
 // ---------- HELPERS ----------
+function readField(obj, key, fallbacks = []) {
+  if (obj[key] != null) return obj[key];
+  for (const fb of fallbacks) if (obj[fb] != null) return obj[fb];
+  return undefined;
+}
+
 function firstUrl(val) {
-  if (Array.isArray(val) && val[0]?.url) return val[0].url; // Airtable attachment
+  if (Array.isArray(val) && val[0]?.url) return val[0].url; // attachment
   if (typeof val === 'string') return val;                   // plain URL
   return undefined;
 }
@@ -128,12 +135,6 @@ async function fetchClosetItemsByIds(ids) {
   return out;
 }
 
-function readField(obj, key, fallbacks = []) {
-  if (obj[key] != null) return obj[key];
-  for (const fb of fallbacks) if (obj[fb] != null) return obj[fb];
-  return undefined;
-}
-
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
   const system = `You are a fashion stylist AI. Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["string"],"reasoning":"string","palette":["string"],"preview":""}]}`;
@@ -142,10 +143,11 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
     occasion, weather: weather || '', style: style || '',
     items: items.map(i => ({
       id: i.id,
-      name: readField(i.fields, CLOSET_NAME_FIELD, ['Name','Title','Item']) || 'Unknown',
+      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || 'Unknown',
       category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
       color: readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
       brand: readField(i.fields, CLOSET_BRAND_FIELD, ['Brand']) || '',
+      photo: firstUrl(readField(i.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']))
     })),
     count: topK
   };
@@ -168,13 +170,10 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
 }
 
 function buildOutfitFields(outfit, items, meta) {
-  const {
-    occasion = '', style = '', weather = ''
-  } = meta;
-
+  const { occasion = '', style = '', weather = '' } = meta;
   const fields = {
     [OUTFITS_NAME_FIELD]: outfit.name,
-    [OUTFITS_ITEMS_FIELD]: items.map(i => i.id), // must be a Link field
+    [OUTFITS_ITEMS_FIELD]: items.map(i => i.id), // Link field
     [OUTFITS_OCCASION_FIELD]: occasion,
     [OUTFITS_STYLE_FIELD]: style,
     [OUTFITS_WEATHER_FIELD]: weather,
@@ -183,7 +182,7 @@ function buildOutfitFields(outfit, items, meta) {
   };
 
   if (outfit.preview) {
-    if (PHOTO_AS_ATTACHMENT) {
+    if (OUTFITS_PHOTO_IS_ATTACHMENT) {
       fields[OUTFITS_PHOTO_FIELD] = [{ url: outfit.preview }];
     } else {
       fields[OUTFITS_PHOTO_FIELD] = outfit.preview;
@@ -195,22 +194,26 @@ function buildOutfitFields(outfit, items, meta) {
 // ---------- ROUTES ----------
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
 
-// List/search closet items (helps the app find IDs to send)
+// List/search clothing items
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
     const { q, limit = 50 } = req.query;
     const cfg = { pageSize: Math.min(Number(limit) || 50, 100) };
     if (q) cfg.filterByFormula = `FIND(LOWER("${String(q).toLowerCase()}"), LOWER({${CLOSET_NAME_FIELD}}))`;
     const records = await tbCloset.select(cfg).all();
-    const data = records.map(r => ({
-  id: r.id,
-  name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-  category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-  brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
-  color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-  const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
-const imageUrl = firstUrl(rawPhoto);
-}));
+
+    const data = records.map(r => {
+      const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
+      const imageUrl = firstUrl(rawPhoto);
+      return {
+        id: r.id,
+        name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+        category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+        brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+        color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+        imageUrl
+      };
+    });
 
     res.json({ data });
   } catch (err) { next(err); }
@@ -239,15 +242,9 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
 });
 
 // Create order
-const CreateOrder = z.object({
-  userId: z.string().min(1),
-  outfitId: z.string().min(1),
-  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
-  note: z.string().optional()
-});
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const parsed = CreateOrder.safeParse(req.body);
+    const parsed = CreateOrderSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
 
     const { userId, outfitId, fulfillment, note } = parsed.data;
