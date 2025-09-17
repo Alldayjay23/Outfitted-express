@@ -152,22 +152,42 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
     count: topK
   };
 
-  const resp = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.2,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: `Make ${topK} outfit suggestion(s). Return ONLY JSON.\n${JSON.stringify(user, null, 2)}` }
-    ],
-    response_format: { type: 'json_object' }
-  });
+  let content;
+  try {
+    // Some accounts/models don’t honor strict JSON; this still works reliably.
+    const resp = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: `Make ${topK} outfit suggestion(s). Return ONLY JSON.\n${JSON.stringify(user, null, 2)}` }
+      ]
+      // (no response_format) -> we’ll extract JSON robustly below
+    });
+    content = resp.choices?.[0]?.message?.content || '';
+  } catch (e) {
+    const msg = e?.response?.data?.error?.message || e.message || 'OpenAI error';
+    const status = e?.status || e?.response?.status || 502;
+    throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e?.response?.data });
+  }
 
-  let parsed;
-  try { parsed = JSON.parse(resp.choices?.[0]?.message?.content ?? '{}'); }
-  catch { throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502 }); }
+  // Extract JSON even if the model wrapped it in prose/fences
+  const extractJson = (s) => {
+    if (!s) return null;
+    s = s.replace(/```json|```/g, '').trim();
+    const start = s.indexOf('{');
+    const end = s.lastIndexOf('}');
+    if (start === -1 || end === -1) return null;
+    try { return JSON.parse(s.slice(start, end + 1)); } catch { return null; }
+  };
+
+  const parsed = extractJson(content);
+  if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
   if (!parsed?.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
+
   return parsed.outfits;
 }
+
 
 function buildOutfitFields(outfit, items, meta) {
   const { occasion = '', style = '', weather = '' } = meta;
