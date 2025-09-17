@@ -31,6 +31,9 @@ const {
   CLOSET_BRAND_FIELD = 'Brand',
   CLOSET_COLOR_FIELD = 'Colors',
   CLOSET_IMAGEURL_FIELD = 'Image URL',
+  CLOSET_PHOTO_FIELD = 'Photo',
+  CLOSET_PHOTO_AS_ATTACHMENT = 'true',
+  const CLOSET_PHOTO_IS_ATTACHMENT = String(CLOSET_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
 
   OUTFITS_NAME_FIELD = 'Title',
   OUTFITS_ITEMS_FIELD = 'Items',
@@ -41,7 +44,7 @@ const {
   OUTFITS_OCCASION_FIELD = 'Occasion',
   OUTFITS_STYLE_FIELD = 'Style',
   OUTFITS_WEATHER_FIELD = 'Weather',
-  OUTFITS_PHOTO_AS_ATTACHMENT = 'false'
+  OUTFITS_PHOTO_AS_ATTACHMENT = 'true'
 } = process.env;
 
 if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
@@ -108,6 +111,12 @@ const CreateOrderSchema = z.object({
 });
 
 // ---------- HELPERS ----------
+function firstUrl(val) {
+  if (Array.isArray(val) && val[0]?.url) return val[0].url; // Airtable attachment
+  if (typeof val === 'string') return val;                   // plain URL
+  return undefined;
+}
+
 async function fetchClosetItemsByIds(ids) {
   const out = [];
   for (let i = 0; i < ids.length; i += 10) {
@@ -194,13 +203,15 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
     if (q) cfg.filterByFormula = `FIND(LOWER("${String(q).toLowerCase()}"), LOWER({${CLOSET_NAME_FIELD}}))`;
     const records = await tbCloset.select(cfg).all();
     const data = records.map(r => ({
-      id: r.id,
-      name: readField(r.fields, CLOSET_NAME_FIELD, ['Name','Title','Item']),
-      category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-      brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
-      color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-      imageUrl: readField(r.fields, CLOSET_IMAGEURL_FIELD, ['Image URL']),
-    }));
+  id: r.id,
+  name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+  category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+  brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+  color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+  const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
+const imageUrl = firstUrl(rawPhoto);
+}));
+
     res.json({ data });
   } catch (err) { next(err); }
 });
