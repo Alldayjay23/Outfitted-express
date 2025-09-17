@@ -245,6 +245,9 @@ function buildOutfitFields(outfit, items, meta) {
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
 
 // List/search clothing items
+app.get('/', (req, res) => {
+  res.type('text').send('Outfitted API is running. Try GET /healthz');
+});
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
     const { q, limit = 50 } = req.query;
