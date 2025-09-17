@@ -135,12 +135,17 @@ async function fetchClosetItemsByIds(ids) {
   return out;
 }
 
+// ==== generateOutfitsWithAI (BEGIN) ====
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
+  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
   const system = `You are a fashion stylist AI. Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["string"],"reasoning":"string","palette":["string"],"preview":""}]}`;
 
   const user = {
-    occasion, weather: weather || '', style: style || '',
+    occasion,
+    weather: weather || '',
+    style: style || '',
     items: items.map(i => ({
       id: i.id,
       name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || 'Unknown',
@@ -152,41 +157,66 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
     count: topK
   };
 
-  let content;
-  try {
-    // Some accounts/models don’t honor strict JSON; this still works reliably.
-    const resp = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      temperature: 0.2,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: `Make ${topK} outfit suggestion(s). Return ONLY JSON.\n${JSON.stringify(user, null, 2)}` }
-      ]
-      // (no response_format) -> we’ll extract JSON robustly below
-    });
-    content = resp.choices?.[0]?.message?.content || '';
-  } catch (e) {
-    const msg = e?.response?.data?.error?.message || e.message || 'OpenAI error';
-    const status = e?.status || e?.response?.status || 502;
-    throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e?.response?.data });
-  }
+  const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
+Return ONLY JSON. No prose.
 
-  // Extract JSON even if the model wrapped it in prose/fences
+Input:
+${JSON.stringify(user, null, 2)}
+`;
+
   const extractJson = (s) => {
     if (!s) return null;
     s = s.replace(/```json|```/g, '').trim();
-    const start = s.indexOf('{');
-    const end = s.lastIndexOf('}');
-    if (start === -1 || end === -1) return null;
-    try { return JSON.parse(s.slice(start, end + 1)); } catch { return null; }
+    const a = s.indexOf('{'), b = s.lastIndexOf('}');
+    if (a === -1 || b === -1) return null;
+    try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
   };
 
-  const parsed = extractJson(content);
-  if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
-  if (!parsed?.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
-
-  return parsed.outfits;
+  // ---- Try Responses API first
+  try {
+    const r = await openai.responses.create({
+      model,
+      input: [
+        { role: 'system', content: system },
+        { role: 'user', content: prompt }
+      ],
+      response_format: { type: 'json_object' }
+    });
+    const text = r.output_text || (r.output?.[0]?.content?.[0]?.text ?? '');
+    const parsed = extractJson(text);
+    if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
+    if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
+    return parsed.outfits;
+  } catch (e1) {
+    // If Responses is blocked/unauthorized, fall back to Chat Completions
+    if (e1?.status === 403 || /not authorized/i.test(e1?.message || '')) {
+      try {
+        const resp = await openai.chat.completions.create({
+          model,
+          temperature: 0.2,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: prompt }
+          ]
+        });
+        const content = resp.choices?.[0]?.message?.content || '';
+        const parsed = extractJson(content);
+        if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
+        if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
+        return parsed.outfits;
+      } catch (e2) {
+        const msg = e2?.response?.data?.error?.message || e2.message || 'OpenAI error';
+        const status = e2?.status || e2?.response?.status || 502;
+        throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e2?.response?.data });
+      }
+    }
+    const msg = e1?.response?.data?.error?.message || e1.message || 'OpenAI error';
+    const status = e1?.status || e1?.response?.status || 502;
+    throw Object.assign(new Error(`OPENAI_ERROR: ${msg}`), { status, details: e1?.response?.data });
+  }
 }
+// ==== generateOutfitsWithAI (END) ====
+
 
 
 function buildOutfitFields(outfit, items, meta) {
