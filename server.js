@@ -397,4 +397,59 @@ const CreateOrderSchema = z.object({
 });
 
 // POST /api/orders  (idempotent via Idempotency Key)
-app.post('/api/orders', requireApiKey, as
+app.post('/api/orders', requireApiKey, async (req, res, next) => {
+  try {
+    const { userId, outfitId, fulfillment, note, idempotencyKey } =
+      CreateOrderSchema.parse(req.body);
+
+    // 1) Idempotency check
+    const safeKey = String(idempotencyKey).replace(/'/g, "\\'");
+    const existing = await tbOrders
+      .select({ maxRecords: 1, filterByFormula: `{Idempotency Key} = '${safeKey}'` })
+      .firstPage();
+
+    if (existing.length) {
+      const r = existing[0];
+      return res.status(200).json({ data: { id: r.id, ...r.fields } });
+    }
+
+    // 2) Validate outfit exists
+    const outfit = await tbOutfits.find(outfitId).catch(() => null);
+    if (!outfit) {
+      return res
+        .status(404)
+        .json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
+    }
+
+    // 3) Create order
+    const fields = {
+      'User Id': userId,
+      'Outfit': [outfitId],     // single linked record
+      'Status': 'pending',
+      'Fulfillment': fulfillment,
+      'Note': note || '',
+      'Idempotency Key': idempotencyKey
+    };
+
+    const recs = await tbOrders.create([{ fields }]);
+    return res.status(201).json({ data: { id: recs[0].id, ...fields } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/orders/:id
+app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
+  try {
+    const rec = await tbOrders.find(req.params.id);
+    res.json({ data: { id: rec.id, ...rec.fields } });
+  } catch (err) {
+    if (String(err).includes('NOT_FOUND')) {
+      return res
+        .status(404)
+        .json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
+    }
+    next(err);
+  }
+});
+
