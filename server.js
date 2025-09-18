@@ -129,12 +129,6 @@ const OutfitSuggestSchema = z.object({
   itemIds: z.array(z.string()).nonempty('Provide itemIds from Clothing Items'),
   topK: z.number().int().min(1).max(5).default(1)
 });
-const CreateOrderSchema = z.object({
-  userId: z.string().min(1),
-  outfitId: z.string().min(1),
-  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
-  note: z.string().max(2000).optional()
-});
 
 // ---------- OPENAI ----------
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
