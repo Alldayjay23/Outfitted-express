@@ -331,46 +331,68 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Orders (IDEMPOTENT)
+// ---------- ORDERS ----------
+const ORDERS_IDEMPOTENCY_FIELD = 'Idempotency Key';
+
+// include idempotencyKey in the schema
+const CreateOrderSchema = z.object({
+  userId: z.string().min(1),
+  outfitId: z.string().min(1),
+  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
+  note: z.string().max(2000).optional(),
+  idempotencyKey: z.string().min(1).optional(),
+});
+
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const parsed = CreateOrderSchema.extend({
-      idempotencyKey: z.string().optional()
-    }).safeParse(req.body);
-
+    const parsed = CreateOrderSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
     }
 
     const { userId, outfitId, fulfillment, note, idempotencyKey } = parsed.data;
-    const key = idempotencyKey || req.id;
-    const keyEsc = String(key).replace(/"/g, '\\"');
 
-    // de-dupe by Idempotency Key field
-    const dup = await tbOrders.select({
-      filterByFormula: `FIND("${keyEsc}", {Idempotency Key})`,
-      maxRecords: 1
-    }).all();
-
-    if (dup.length) {
-      return res.status(200).json({ data: { id: dup[0].id, ...dup[0].fields }, idempotent: true });
-    }
-
+    // ensure outfit exists
     const outfit = await tbOutfits.find(outfitId).catch(() => null);
     if (!outfit) return res.status(404).json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
 
+    // prefer header, then body, finally a deterministic fallback
+    const key =
+      req.header('idempotency-key') ||
+      idempotencyKey ||
+      `${userId}:${outfitId}:${fulfillment}`;
+
+    // idempotency: return existing order if the key already exists
+    const existing = await tbOrders
+      .select({ filterByFormula: `{${ORDERS_IDEMPOTENCY_FIELD}} = "${key}"` })
+      .firstPage();
+
+    if (existing.length) {
+      const r = existing[0];
+      return res.status(200).json({ data: { id: r.id, ...r.fields }, idempotent: true });
+    }
+
+    // create the order
     const fields = {
       'User Id': userId,
       'Outfit': [outfitId],
       'Status': 'pending',
       'Fulfillment': fulfillment,
       'Note': note || '',
-      'Idempotency Key': key
+      [ORDERS_IDEMPOTENCY_FIELD]: key,
     };
 
     const recs = await tbOrders.create([{ fields }]);
-    res.status(201).json({ data: { id: recs[0].id, ...fields }, idempotent: false });
-  } catch (err) { next(err); }
+    return res.status(201).json({ data: { id: recs[0].id, ...fields }, idempotent: false });
+  } catch (err) {
+    // improve the error you saw
+    if (String(err?.message || '').includes('Unknown field name')) {
+      err.status = 400;
+      err.code = 'AIRTABLE_SCHEMA_MISMATCH';
+      err.details = 'Check Orders table field names: User Id, Outfit (link), Status, Fulfillment, Note, Idempotency Key';
+    }
+    next(err);
+  }
 });
 
 app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
