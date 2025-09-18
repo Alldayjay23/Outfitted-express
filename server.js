@@ -213,6 +213,13 @@ ${JSON.stringify(user, null, 2)}
 }
 
 // ---------- ROUTES ----------
+app.get('/api/debug/config', requireApiKey, (req, res) => {
+  res.json({
+    skipOpenAI: String(process.env.SKIP_OPENAI),
+    model: process.env.OPENAI_MODEL || null,
+    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
+  });
+});
 app.get('/', (req, res) => {
   res.type('text').send('Outfitted API is running. Try GET /healthz');
 });
