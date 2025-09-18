@@ -313,44 +313,6 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   }
 });
 
-
-    // NEW: respect SKIP_OPENAI no matter what
-let outfits;
-if (String(process.env.SKIP_OPENAI).toLowerCase() === 'true') {
-  outfits = [{
-    name: `${style || 'Look'} for ${occasion}`,
-    items: items.map(i => i.id),
-    reasoning: 'AI skipped (SKIP_OPENAI=true).',
-    palette: ['neutral'],
-    preview: ''
-  }];
-} else {
-  outfits = await generateOutfitsWithAI({ items, occasion, weather, style, topK });
-}
-    
-    const created = [];
-    for (const o of outfits) {
-      const fields = {
-        [OUTFITS_NAME_FIELD]: o.name,
-        [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
-        [OUTFITS_OCCASION_FIELD]: occasion,
-        [OUTFITS_STYLE_FIELD]: style || '',
-        [OUTFITS_WEATHER_FIELD]: weather || '',
-        [OUTFITS_REASON_FIELD]: o.reasoning || '',
-        [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : ''
-      };
-      if (o.preview) {
-        if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
-        else fields[OUTFITS_PHOTO_FIELD] = o.preview;
-      }
-      const rec = await tbOutfits.create([{ fields }]);
-      created.push({ id: rec[0].id, fields });
-    }
-
-    res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields })) });
-  } catch (err) { next(err); }
-});
-
 // Orders
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
