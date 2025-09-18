@@ -270,8 +270,20 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
 
     if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
-    const outfits = await generateOutfitsWithAI({ items, occasion, weather, style, topK });
-
+    // NEW: respect SKIP_OPENAI no matter what
+let outfits;
+if (String(process.env.SKIP_OPENAI).toLowerCase() === 'true') {
+  outfits = [{
+    name: `${style || 'Look'} for ${occasion}`,
+    items: items.map(i => i.id),
+    reasoning: 'AI skipped (SKIP_OPENAI=true).',
+    palette: ['neutral'],
+    preview: ''
+  }];
+} else {
+  outfits = await generateOutfitsWithAI({ items, occasion, weather, style, topK });
+}
+    
     const created = [];
     for (const o of outfits) {
       const fields = {
