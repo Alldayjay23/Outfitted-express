@@ -331,76 +331,71 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ---------- ORDERS ----------
-const ORDERS_IDEMPOTENCY_FIELD = 'Idempotency Key';
-
-// include idempotencyKey in the schema
+// ---------- ORDERS (idempotent) ----------
 const CreateOrderSchema = z.object({
   userId: z.string().min(1),
   outfitId: z.string().min(1),
-  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
-  note: z.string().max(2000).optional(),
-  idempotencyKey: z.string().min(1).optional(),
+  fulfillment: z.enum(['delivery', 'pickup', 'stylist']).default('delivery'),
+  note: z.string().max(2000).optional().default(''),
+  idempotencyKey: z.string().min(1)
 });
 
+// POST /api/orders  (idempotent via Idempotency Key)
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const parsed = CreateOrderSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
-    }
+    const { userId, outfitId, fulfillment, note, idempotencyKey } =
+      CreateOrderSchema.parse(req.body);
 
-    const { userId, outfitId, fulfillment, note, idempotencyKey } = parsed.data;
-
-    // ensure outfit exists
-    const outfit = await tbOutfits.find(outfitId).catch(() => null);
-    if (!outfit) return res.status(404).json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
-
-    // prefer header, then body, finally a deterministic fallback
-    const key =
-      req.header('idempotency-key') ||
-      idempotencyKey ||
-      `${userId}:${outfitId}:${fulfillment}`;
-
-    // idempotency: return existing order if the key already exists
+    // 1) Idempotency check
+    const safeKey = String(idempotencyKey).replace(/'/g, "\\'");
     const existing = await tbOrders
-      .select({ filterByFormula: `{${ORDERS_IDEMPOTENCY_FIELD}} = "${key}"` })
+      .select({
+        maxRecords: 1,
+        filterByFormula: `{Idempotency Key} = '${safeKey}'`
+      })
       .firstPage();
 
     if (existing.length) {
       const r = existing[0];
-      return res.status(200).json({ data: { id: r.id, ...r.fields }, idempotent: true });
+      return res.status(200).json({ data: { id: r.id, ...r.fields } });
     }
 
-    // create the order
+    // 2) Validate outfit exists
+    const outfit = await tbOutfits.find(outfitId).catch(() => null);
+    if (!outfit) {
+      return res
+        .status(404)
+        .json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
+    }
+
+    // 3) Create order
     const fields = {
       'User Id': userId,
-      'Outfit': [outfitId],
+      'Outfit': [outfitId],            // must be a single linked record field
       'Status': 'pending',
       'Fulfillment': fulfillment,
       'Note': note || '',
-      [ORDERS_IDEMPOTENCY_FIELD]: key,
+      'Idempotency Key': idempotencyKey
     };
 
     const recs = await tbOrders.create([{ fields }]);
-    return res.status(201).json({ data: { id: recs[0].id, ...fields }, idempotent: false });
+    return res.status(201).json({ data: { id: recs[0].id, ...fields } });
   } catch (err) {
-    // improve the error you saw
-    if (String(err?.message || '').includes('Unknown field name')) {
-      err.status = 400;
-      err.code = 'AIRTABLE_SCHEMA_MISMATCH';
-      err.details = 'Check Orders table field names: User Id, Outfit (link), Status, Fulfillment, Note, Idempotency Key';
-    }
     next(err);
   }
 });
 
+// GET /api/orders/:id
 app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
   try {
     const rec = await tbOrders.find(req.params.id);
-    res.json({ data: { id: rec.id, fields: rec.fields } });
+    res.json({ data: { id: rec.id, ...rec.fields } });
   } catch (err) {
-    if (String(err).includes('NOT_FOUND')) return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
+    if (String(err).includes('NOT_FOUND')) {
+      return res
+        .status(404)
+        .json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
+    }
     next(err);
   }
 });
