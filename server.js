@@ -120,6 +120,19 @@ function firstUrl(val) {
   return undefined;
 }
 
+// Batch-resolve closet records by Airtable RECORD_ID()
+async function fetchClosetItemsByIds(ids = []) {
+  if (!Array.isArray(ids) || !ids.length) return [];
+  const out = [];
+  for (let i = 0; i < ids.length; i += 10) {
+    const batch = ids.slice(i, i + 10);
+    const formula = `OR(${batch.map(id => `RECORD_ID() = '${id}'`).join(', ')})`;
+    const page = await tbCloset.select({ filterByFormula: formula }).all();
+    out.push(...page.map(r => ({ id: r.id, fields: r.fields })));
+  }
+  return out;
+}
+
 // ---------- SCHEMAS ----------
 const OutfitSuggestSchema = z.object({
   userId: z.string().optional(),
@@ -128,6 +141,18 @@ const OutfitSuggestSchema = z.object({
   style: z.string().optional(),
   itemIds: z.array(z.string()).nonempty('Provide itemIds from Clothing Items'),
   topK: z.number().int().min(1).max(5).default(1)
+});
+
+// New: saving an outfit (exact items chosen)
+const SaveOutfitSchema = z.object({
+  title: z.string().min(1),
+  itemIds: z.array(z.string()).min(1),     // Airtable record IDs
+  occasion: z.string().optional(),
+  style: z.string().optional(),
+  weather: z.string().optional(),
+  reasoning: z.string().optional(),
+  palette: z.array(z.string()).optional(), // e.g. ["navy","white"]
+  photoUrl: z.string().url().optional()    // optional preview
 });
 
 // ---------- OPENAI ----------
@@ -275,18 +300,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
 
     const { occasion, weather, style, itemIds, topK } = parsed.data;
 
-    const fetchByIds = async (ids) => {
-      const out = [];
-      for (let i = 0; i < ids.length; i += 10) {
-        const batch = ids.slice(i, i + 10);
-        const formula = `OR(${batch.map(id => `RECORD_ID() = '${id}'`).join(', ')})`;
-        const page = await tbCloset.select({ filterByFormula: formula }).all();
-        out.push(...page.map(r => ({ id: r.id, fields: r.fields })));
-      }
-      return out;
-    };
-
-    const items = await fetchByIds(itemIds);
+    const items = await fetchClosetItemsByIds(itemIds);
     if (!items.length) {
       return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
     }
@@ -325,6 +339,54 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Save an outfit with the exact items chosen by the client
+app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
+  try {
+    const { title, itemIds, occasion, style, weather, reasoning, palette, photoUrl } =
+      SaveOutfitSchema.parse(req.body);
+
+    // 1) Validate the items exist
+    const items = await fetchClosetItemsByIds(itemIds);
+    if (items.length !== itemIds.length) {
+      return res.status(400).json({
+        error: {
+          code: 'ITEMS_NOT_FOUND',
+          message: 'Some itemIds are invalid or missing in Airtable',
+          details: { requested: itemIds.length, found: items.length }
+        }
+      });
+    }
+
+    // 2) Build Airtable fields
+    const fields = {
+      [OUTFITS_NAME_FIELD]: title,
+      [OUTFITS_ITEMS_FIELD]: itemIds, // exact IDs the user picked
+      [OUTFITS_OCCASION_FIELD]: occasion || '',
+      [OUTFITS_STYLE_FIELD]: style || '',
+      [OUTFITS_WEATHER_FIELD]: weather || '',
+      [OUTFITS_REASON_FIELD]: reasoning || '',
+      [OUTFITS_PALETTE_FIELD]: Array.isArray(palette) ? palette.join(', ') : ''
+    };
+    if (photoUrl) {
+      if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: photoUrl }];
+      else fields[OUTFITS_PHOTO_FIELD] = photoUrl;
+    }
+
+    // 3) Create record
+    const recs = await tbOutfits.create([{ fields }]);
+    const created = recs[0];
+
+    return res.status(201).json({
+      data: {
+        id: created.id,
+        title,
+        items: itemIds,
+        occasion, style, weather, reasoning, palette, photoUrl
+      }
+    });
+  } catch (err) { next(err); }
+});
+
 // ---------- ORDERS (idempotent) ----------
 const CreateOrderSchema = z.object({
   userId: z.string().min(1),
@@ -335,81 +397,4 @@ const CreateOrderSchema = z.object({
 });
 
 // POST /api/orders  (idempotent via Idempotency Key)
-app.post('/api/orders', requireApiKey, async (req, res, next) => {
-  try {
-    const { userId, outfitId, fulfillment, note, idempotencyKey } =
-      CreateOrderSchema.parse(req.body);
-
-    // 1) Idempotency check
-    const safeKey = String(idempotencyKey).replace(/'/g, "\\'");
-    const existing = await tbOrders
-      .select({
-        maxRecords: 1,
-        filterByFormula: `{Idempotency Key} = '${safeKey}'`
-      })
-      .firstPage();
-
-    if (existing.length) {
-      const r = existing[0];
-      return res.status(200).json({ data: { id: r.id, ...r.fields } });
-    }
-
-    // 2) Validate outfit exists
-    const outfit = await tbOutfits.find(outfitId).catch(() => null);
-    if (!outfit) {
-      return res
-        .status(404)
-        .json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
-    }
-
-    // 3) Create order
-    const fields = {
-      'User Id': userId,
-      'Outfit': [outfitId],            // must be a single linked record field
-      'Status': 'pending',
-      'Fulfillment': fulfillment,
-      'Note': note || '',
-      'Idempotency Key': idempotencyKey
-    };
-
-    const recs = await tbOrders.create([{ fields }]);
-    return res.status(201).json({ data: { id: recs[0].id, ...fields } });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/orders/:id
-app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
-  try {
-    const rec = await tbOrders.find(req.params.id);
-    res.json({ data: { id: rec.id, ...rec.fields } });
-  } catch (err) {
-    if (String(err).includes('NOT_FOUND')) {
-      return res
-        .status(404)
-        .json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
-    }
-    next(err);
-  }
-});
-
-// ---------- ERROR HANDLER ----------
-/* eslint-disable no-unused-vars */
-app.use((err, req, res, next) => {
-  const status = err.status || 500;
-  const payload = {
-    code: err.code || 'INTERNAL_ERROR',
-    message: err.message || 'Unexpected server error',
-    details: err.details,
-    requestId: req.id
-  };
-  req.log.error({ err, status, path: req.path, requestId: req.id });
-  res.status(status).json({ error: payload });
-});
-/* eslint-enable no-unused-vars */
-
-// ---------- BOOT ----------
-app.listen(PORT, () => {
-  console.log(`✅ Outfitted API on ${PORT} (${NODE_ENV})`);
-});
+app.post('/api/orders', requireApiKey, as
