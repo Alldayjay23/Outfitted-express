@@ -11,6 +11,15 @@ import Airtable from 'airtable';
 import { z } from 'zod';
 import OpenAI from 'openai';
 
+// ---------- PROCESS SAFETY ----------
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED_REJECTION', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT_EXCEPTION', err);
+  process.exit(1);
+});
+
 // ---------- ENV ----------
 const {
   PORT = 10000,
@@ -51,7 +60,7 @@ const {
 } = process.env;
 
 if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
-if (!OPENAI_API_KEY && SKIP_OPENAI !== 'true') { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
+if (!OPENAI_API_KEY && String(SKIP_OPENAI).toLowerCase() !== 'true') { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
 if (!API_KEY) { console.error('⚠️ Missing API_KEY'); process.exit(1); }
 
 const CLOSET_PHOTO_IS_ATTACHMENT  = String(CLOSET_PHOTO_AS_ATTACHMENT).toLowerCase() === 'true';
@@ -59,7 +68,8 @@ const OUTFITS_PHOTO_IS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerC
 
 // ---------- CORE ----------
 const app = express();
-app.set('trust proxy', 1); // behind Render/Cloudflare for correct client IP in rate limiter
+app.set('trust proxy', 1); // behind Render/Cloudflare
+
 const allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
@@ -79,7 +89,7 @@ const logger = pinoHttp({
 });
 app.use(logger);
 
-const limiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+const limiter = rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true, legacyHeaders: false });
 app.use('/api/', limiter);
 
 // ---------- AUTH ----------
@@ -129,7 +139,6 @@ const CreateOrderSchema = z.object({
 // ---------- OPENAI ----------
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
   if (String(SKIP_OPENAI).toLowerCase() === 'true') {
-    // Deterministic stub for debugging
     return [{
       name: `${style || 'Look'} for ${occasion}`,
       items: items.map(i => i.id),
@@ -170,7 +179,6 @@ ${JSON.stringify(user, null, 2)}
     try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
   };
 
-  // ---- Try Responses API first (no text.format; we parse ourselves)
   try {
     const r = await openai.responses.create({
       model: OPENAI_MODEL,
@@ -190,7 +198,6 @@ ${JSON.stringify(user, null, 2)}
     if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
     return parsed.outfits;
   } catch (e1) {
-    // Fall back to Chat Completions (if allowed)
     try {
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
@@ -214,27 +221,25 @@ ${JSON.stringify(user, null, 2)}
 }
 
 // ---------- ROUTES ----------
-// Debug: list registered routes (to see if we have duplicate suggest handlers)
-app.get('/api/debug/routes', requireApiKey, (req, res) => {
-  const routes = [];
-  (app._router?.stack || []).forEach((m) => {
-    if (m.route && m.route.path) {
-      routes.push({
-        method: Object.keys(m.route.methods || {})[0],
-        path: m.route.path
-      });
-    }
+// Debug routes only in non-production
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/api/debug/routes', requireApiKey, (req, res) => {
+    const routes = [];
+    (app._router?.stack || []).forEach((m) => {
+      if (m.route?.path) routes.push({ method: Object.keys(m.route.methods || {})[0], path: m.route.path });
+    });
+    res.json({ routes });
   });
-  res.json({ routes });
-});
 
-app.get('/api/debug/config', requireApiKey, (req, res) => {
-  res.json({
-    skipOpenAI: String(process.env.SKIP_OPENAI),
-    model: process.env.OPENAI_MODEL || null,
-    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
+  app.get('/api/debug/config', requireApiKey, (req, res) => {
+    res.json({
+      skipOpenAI: String(process.env.SKIP_OPENAI),
+      model: process.env.OPENAI_MODEL || null,
+      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
+    });
   });
-});
+}
+
 app.get('/', (req, res) => {
   res.type('text').send('Outfitted API is running. Try GET /healthz');
 });
@@ -265,21 +270,17 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Suggest outfits (TEMP: no-AI path to unblock launch)
+// Suggest outfits (stub when SKIP_OPENAI=true)
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   req.log.info('USING_STUB_SUGGEST');
   try {
-    // 1) validate input
     const parsed = OutfitSuggestSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({
-        error: { code: 'BAD_REQUEST', message: parsed.error.flatten() }
-      });
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
     }
 
-    const { occasion, weather, style, itemIds } = parsed.data;
+    const { occasion, weather, style, itemIds, topK } = parsed.data;
 
-    // 2) fetch items by Airtable record IDs
     const fetchByIds = async (ids) => {
       const out = [];
       for (let i = 0; i < ids.length; i += 10) {
@@ -293,57 +294,85 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
 
     const items = await fetchByIds(itemIds);
     if (!items.length) {
-      return res.status(400).json({
-        error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' }
-      });
+      return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
     }
 
-    // 3) build a deterministic suggestion (no OpenAI)
-    const colors = Array.from(new Set(
-      items
-        .map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim())
-        .filter(Boolean)
-    ));
+    // If AI is on, call it; else deterministic stub:
+    const outfits = (String(SKIP_OPENAI).toLowerCase() === 'true')
+      ? [{
+          name: `${style ? `${style} ` : ''}${occasion} fit`.trim(),
+          items: items.map(i => i.id),
+          reasoning: `Server stub (no AI): combined ${items.length} item(s) for ${occasion}${style ? ` in ${style} style.` : '.'}`,
+          palette: Array.from(new Set(items.map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim()).filter(Boolean))).slice(0,5),
+          preview: ''
+        }]
+      : await generateOutfitsWithAI({ items, occasion, weather, style, topK });
 
-    const title = `${style ? `${style} ` : ''}${occasion} fit`.trim();
-    const reasoning =
-      `Server stub (no AI): combined ${items.length} item(s) for ${occasion}` +
-      (style ? ` in ${style} style.` : '.');
+    const created = [];
+    for (const o of outfits) {
+      const fields = {
+        [OUTFITS_NAME_FIELD]: o.name,
+        [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
+        [OUTFITS_OCCASION_FIELD]: occasion,
+        [OUTFITS_STYLE_FIELD]: style || '',
+        [OUTFITS_WEATHER_FIELD]: weather || '',
+        [OUTFITS_REASON_FIELD]: o.reasoning || '',
+        [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : ''
+      };
+      if (o.preview) {
+        if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
+        else fields[OUTFITS_PHOTO_FIELD] = o.preview;
+      }
+      const rec = await tbOutfits.create([{ fields }]);
+      created.push({ id: rec[0].id, fields });
+    }
 
-    // 4) save one outfit
-    const fields = {
-      [OUTFITS_NAME_FIELD]: title,
-      [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
-      [OUTFITS_OCCASION_FIELD]: occasion,
-      [OUTFITS_STYLE_FIELD]: style || '',
-      [OUTFITS_WEATHER_FIELD]: weather || '',
-      [OUTFITS_REASON_FIELD]: reasoning,
-      [OUTFITS_PALETTE_FIELD]: colors.slice(0, 5).join(', ')
-      // no photo while AI is off
-    };
-
-    const rec = await tbOutfits.create([{ fields }]);
-    return res.status(201).json({ data: [{ id: rec[0].id, ...fields }] });
-  } catch (err) {
-    next(err);
-  }
+    res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields })) });
+  } catch (err) { next(err); }
 });
 
-// Orders
+// Orders (IDEMPOTENT)
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const parsed = CreateOrderSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
+    const parsed = CreateOrderSchema.extend({
+      idempotencyKey: z.string().optional()
+    }).safeParse(req.body);
 
-    const { userId, outfitId, fulfillment, note } = parsed.data;
+    if (!parsed.success) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
+    }
+
+    const { userId, outfitId, fulfillment, note, idempotencyKey } = parsed.data;
+    const key = idempotencyKey || req.id;
+    const keyEsc = String(key).replace(/"/g, '\\"');
+
+    // de-dupe by Idempotency Key field
+    const dup = await tbOrders.select({
+      filterByFormula: `FIND("${keyEsc}", {Idempotency Key})`,
+      maxRecords: 1
+    }).all();
+
+    if (dup.length) {
+      return res.status(200).json({ data: { id: dup[0].id, ...dup[0].fields }, idempotent: true });
+    }
+
     const outfit = await tbOutfits.find(outfitId).catch(() => null);
     if (!outfit) return res.status(404).json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
 
-    const fields = { 'User Id': userId, Outfit: [outfitId], Status: 'pending', Fulfillment: fulfillment, Note: note || '' };
+    const fields = {
+      'User Id': userId,
+      'Outfit': [outfitId],
+      'Status': 'pending',
+      'Fulfillment': fulfillment,
+      'Note': note || '',
+      'Idempotency Key': key
+    };
+
     const recs = await tbOrders.create([{ fields }]);
-    res.status(201).json({ data: { id: recs[0].id, ...fields } });
+    res.status(201).json({ data: { id: recs[0].id, ...fields }, idempotent: false });
   } catch (err) { next(err); }
 });
+
 app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
   try {
     const rec = await tbOrders.find(req.params.id);
