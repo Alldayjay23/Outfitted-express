@@ -59,6 +59,7 @@ const OUTFITS_PHOTO_IS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerC
 
 // ---------- CORE ----------
 const app = express();
+app.set('trust proxy', 1); // behind Render/Cloudflare for correct client IP in rate limiter
 const allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
