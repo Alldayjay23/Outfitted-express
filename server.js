@@ -452,4 +452,23 @@ app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
     next(err);
   }
 });
+// ---------- ERROR HANDLER ----------
+/* eslint-disable no-unused-vars */
+app.use((err, req, res, next) => {
+  const status = err.status || 500;
+  const payload = {
+    code: err.code || 'INTERNAL_ERROR',
+    message: err.message || 'Unexpected server error',
+    details: err.details,
+    requestId: req.id
+  };
+  req.log.error({ err, status, path: req.path, requestId: req.id });
+  res.status(status).json({ error: payload });
+});
+/* eslint-enable no-unused-vars */
+
+// ---------- BOOT ----------
+app.listen(PORT, () => {
+  console.log(`✅ Outfitted API on ${PORT} (${NODE_ENV})`);
+});
 
