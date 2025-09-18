@@ -250,19 +250,21 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Suggest outfits
 // Suggest outfits (TEMP: no-AI path to unblock launch)
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   try {
     // 1) validate input
     const parsed = OutfitSuggestSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: parsed.error.flatten() } });
+      return res.status(400).json({
+        error: { code: 'BAD_REQUEST', message: parsed.error.flatten() }
+      });
     }
-    const { occasion, weather, style, itemIds, topK } = parsed.data;
 
-    // 2) fetch the items by record ids
-    async function fetchByIds(ids) {
+    const { occasion, weather, style, itemIds } = parsed.data;
+
+    // 2) fetch items by Airtable record IDs
+    const fetchByIds = async (ids) => {
       const out = [];
       for (let i = 0; i < ids.length; i += 10) {
         const batch = ids.slice(i, i + 10);
@@ -271,51 +273,46 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
         out.push(...page.map(r => ({ id: r.id, fields: r.fields })));
       }
       return out;
-    }
+    };
+
     const items = await fetchByIds(itemIds);
     if (!items.length) {
-      return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
+      return res.status(400).json({
+        error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' }
+      });
     }
 
-    // 3) build a simple, deterministic “suggestion”
-    const colors = Array.from(new Set(items
-      .map(i => (i.fields['Color'] || i.fields['Colors'] || '').toString().trim())
-      .filter(Boolean)));
+    // 3) build a deterministic suggestion (no OpenAI)
+    const colors = Array.from(new Set(
+      items
+        .map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim())
+        .filter(Boolean)
+    ));
 
-    const outfitName = `${style ? `${style} ` : ''}${occasion} fit`.trim();
-    const reasoning  = `Server stub (no AI): combined ${items.length} item(s) for ${occasion}` +
-                       (style ? ` in ${style} style.` : '.');
+    const title = `${style ? `${style} ` : ''}${occasion} fit`.trim();
+    const reasoning =
+      `Server stub (no AI): combined ${items.length} item(s) for ${occasion}` +
+      (style ? ` in ${style} style.` : '.');
 
-    const outfits = [{
-      name: outfitName,
-      items: items.map(i => i.id),        // linked records
-      reasoning,
-      palette: colors.slice(0, 5),
-      preview: ''                         // no preview image for now
-    }];
-
-    // 4) save to Airtable (same fields as before)
-    const created = [];
-    for (const o of outfits) {
-      const fields = {
-        [OUTFITS_NAME_FIELD]: o.name,
-        [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
-        [OUTFITS_OCCASION_FIELD]: occasion,
-        [OUTFITS_STYLE_FIELD]: style || '',
-        [OUTFITS_WEATHER_FIELD]: weather || '',
-        [OUTFITS_REASON_FIELD]: o.reasoning || '',
-        [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : ''
-      };
+    // 4) save one outfit
+    const fields = {
+      [OUTFITS_NAME_FIELD]: title,
+      [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
+      [OUTFITS_OCCASION_FIELD]: occasion,
+      [OUTFITS_STYLE_FIELD]: style || '',
+      [OUTFITS_WEATHER_FIELD]: weather || '',
+      [OUTFITS_REASON_FIELD]: reasoning,
+      [OUTFITS_PALETTE_FIELD]: colors.slice(0, 5).join(', ')
       // no photo while AI is off
-      const rec = await tbOutfits.create([{ fields }]);
-      created.push({ id: rec[0].id, fields });
-    }
+    };
 
-    return res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields })) });
+    const rec = await tbOutfits.create([{ fields }]);
+    return res.status(201).json({ data: [{ id: rec[0].id, ...fields }] });
   } catch (err) {
     next(err);
   }
 });
+
 
     // NEW: respect SKIP_OPENAI no matter what
 let outfits;
