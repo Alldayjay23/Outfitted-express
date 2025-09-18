@@ -213,6 +213,20 @@ ${JSON.stringify(user, null, 2)}
 }
 
 // ---------- ROUTES ----------
+// Debug: list registered routes (to see if we have duplicate suggest handlers)
+app.get('/api/debug/routes', requireApiKey, (req, res) => {
+  const routes = [];
+  (app._router?.stack || []).forEach((m) => {
+    if (m.route && m.route.path) {
+      routes.push({
+        method: Object.keys(m.route.methods || {})[0],
+        path: m.route.path
+      });
+    }
+  });
+  res.json({ routes });
+});
+
 app.get('/api/debug/config', requireApiKey, (req, res) => {
   res.json({
     skipOpenAI: String(process.env.SKIP_OPENAI),
@@ -252,6 +266,7 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
 
 // Suggest outfits (TEMP: no-AI path to unblock launch)
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
+  req.log.info('USING_STUB_SUGGEST');
   try {
     // 1) validate input
     const parsed = OutfitSuggestSchema.safeParse(req.body);
