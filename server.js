@@ -1,4 +1,4 @@
-// server.js
+// server.js (Outfitted) — unified userId handling, robust image mapping, closet scope, dual response shape
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -65,7 +65,24 @@ const {
 
 // --- User scoping ---
 const USER_ID_FIELD = 'User Id'; // the column name actually used in Airtable
-const getUid = (req) => String(req.header('x-user-id') || '').trim();
+
+// Unified user id helper (header → query → body). Returns null if missing.
+const getUserId = (req) => {
+  const v = req.header('x-user-id') ?? req.query.userId ?? req.body?.userId ?? '';
+  const id = String(v).trim();
+  return id || null;
+};
+// For write ops, require a user id
+const requireUserId = (req) => {
+  const uid = getUserId(req);
+  if (!uid) {
+    const err = new Error('Missing x-user-id');
+    err.status = 400;
+    err.code = 'NO_USER_ID';
+    throw err;
+  }
+  return uid;
+};
 
 if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
 if (!OPENAI_API_KEY && String(SKIP_OPENAI).toLowerCase() !== 'true') { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
@@ -118,18 +135,22 @@ const openai    = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ---------- UTILS ----------
 const esc = (s = '') => String(s).replace(/'/g, "\\'");
-const getUserId = (req) => (req.header('x-user-id') || req.query.userId || '').toString().trim() || null;
-
-function readField(obj, key, fallbacks = []) {
+const readField = (obj, key, fallbacks = []) => {
   if (obj[key] != null) return obj[key];
   for (const fb of fallbacks) if (obj[fb] != null) return obj[fb];
   return undefined;
-}
+};
+
+// Prefer Airtable large thumbnail → raw url → string url
 function firstUrl(val) {
-  if (Array.isArray(val) && val[0]?.url) return val[0].url; // attachment
-  if (typeof val === 'string') return val;                   // plain URL
+  if (Array.isArray(val) && val[0]) {
+    const a = val[0];
+    return (a?.thumbnails?.large?.url) || a?.url;
+  }
+  if (typeof val === 'string' && /^https?:\/\//i.test(val)) return val;
   return undefined;
 }
+
 async function fetchClosetItemsByIds(ids = []) {
   if (!Array.isArray(ids) || !ids.length) return [];
   const out = [];
@@ -318,8 +339,7 @@ Example:
   try { return JSON.parse(jsonStr); } catch { return { name: '', category: '', color: '', brand: '' }; }
 }
 
-// ---------- ROUTES ----------
-// Debug routes only in non-production
+// ---------- DEBUG (non-prod) ----------
 if (process.env.NODE_ENV !== 'production') {
   app.get('/api/debug/routes', requireApiKey, (req, res) => {
     const routes = [];
@@ -336,6 +356,15 @@ if (process.env.NODE_ENV !== 'production') {
       hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY)
     });
   });
+
+  // NEW: quick check of incoming userId sources
+  app.get('/api/debug/whoami', requireApiKey, (req, res) => {
+    res.json({
+      headerUserId: req.header('x-user-id') || null,
+      queryUserId: req.query.userId || null,
+      bodyUserId: req.body?.userId || null
+    });
+  });
 }
 
 app.get('/', (req, res) => res.type('text').send('Outfitted API is running. Try GET /healthz'));
@@ -350,20 +379,28 @@ app.post('/api/closet/describe', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ------- Closet: list/search (BLENDED: mine + catalog) -------
+// ------- Closet: list/search (supports scope=mine|blended|catalog) -------
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
     const uid = getUserId(req);
     const { q, limit = 200 } = req.query;
+    const scope = String(req.query.scope || 'blended').toLowerCase(); // NEW
 
     const nameFilter = q
       ? `FIND(LOWER("${esc(String(q).toLowerCase())}"), LOWER({${CLOSET_NAME_FIELD}}))`
       : null;
 
-    // If we have a user id: show mine OR blank (catalog). If not, show only catalog.
-    const scopeFilter = uid
-      ? `OR({${CLOSET_USER_FIELD}}='${esc(uid)}', {${CLOSET_USER_FIELD}}=BLANK())`
-      : `{${CLOSET_USER_FIELD}}=BLANK()`;
+    let scopeFilter;
+    if (scope === 'mine') {
+      if (!uid) return res.json({ count: 0, items: [], data: [] });
+      scopeFilter = `{${CLOSET_USER_FIELD}}='${esc(uid)}'`;
+    } else if (scope === 'catalog') {
+      scopeFilter = `{${CLOSET_USER_FIELD}}=BLANK()`;
+    } else {
+      scopeFilter = uid
+        ? `OR({${CLOSET_USER_FIELD}}='${esc(uid)}', {${CLOSET_USER_FIELD}}=BLANK())`
+        : `{${CLOSET_USER_FIELD}}=BLANK()`;
+    }
 
     const filters = [nameFilter, scopeFilter].filter(Boolean);
     const cfg = { pageSize: Math.min(Number(limit) || 200, 200) };
@@ -371,7 +408,7 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
 
     const records = await tbCloset.select(cfg).all();
 
-    const data = records.map(r => {
+    const items = records.map(r => {
       const owner = String(readField(r.fields, CLOSET_USER_FIELD, [USER_ID_FIELD]) || '').trim();
       return {
         id: r.id,
@@ -385,14 +422,16 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
       };
     });
 
-    res.json({ data });
+    res.set('Cache-Control', 'no-store');
+    res.json({ count: items.length, items, data: items }); // dual shape
   } catch (err) { next(err); }
 });
 
-// ------- Closet: create (stores user id; typecast true for selects) -------
+// ------- Closet: create (stores user id; typecast true; normalized response) -------
 app.post('/api/closet', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUid(req);
+    const uid = requireUserId(req); // enforce a user id on create
+
     const { name, category, color, brand, imageUrl } = CreateClosetItemSchema.parse(req.body);
 
     const fields = {
@@ -400,27 +439,36 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
       [CLOSET_CATEGORY_FIELD]: category,
       [CLOSET_COLOR_FIELD]: color || '',
       [CLOSET_BRAND_FIELD]: brand || '',
-      [USER_ID_FIELD]: uid
+      [USER_ID_FIELD]: uid // write to actual column
     };
     if (imageUrl) {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
       else fields[CLOSET_PHOTO_FIELD] = imageUrl;
-      // Mirror to a plain URL column too (safe even if it doesn't exist)
-      fields['Image URL'] = imageUrl;
+      fields['Image URL'] = imageUrl; // mirror to plain URL column if present
     }
 
     const recs = await tbCloset.create([{ fields }], { typecast: true });
     const r = recs[0];
-    res.status(201).json({
-      data: { id: r.id, name, category, color, brand, imageUrl: imageUrl || '' }
-    });
+
+    const item = {
+      id: r.id,
+      name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+      category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+      brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+      color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+      imageUrl: readPhotoFromFields(r.fields),
+      source: 'mine',
+      ownerUserId: uid
+    };
+
+    res.status(201).json({ data: item, item, message: 'created' }); // dual shape
   } catch (err) { next(err); }
 });
 
-// ------- Closet: update (only your own) -------
+// ------- Closet: update (only your own; unified user id) -------
 app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUid(req);
+    const uid = requireUserId(req);
     const current = await tbCloset.find(req.params.id);
     if ((current.fields[USER_ID_FIELD] || '') !== uid) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your item' } });
@@ -435,29 +483,29 @@ app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
     if (patch.imageUrl !== undefined) {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = patch.imageUrl ? [{ url: patch.imageUrl }] : [];
       else fields[CLOSET_PHOTO_FIELD] = patch.imageUrl || '';
-      // Keep the plain URL mirror in sync
       fields['Image URL'] = patch.imageUrl || '';
     }
 
     const recs = await tbCloset.update([{ id: req.params.id, fields }], { typecast: true });
     const r = recs[0];
-    res.json({
-      data: {
-        id: r.id,
-        name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-        category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-        brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
-        color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-        imageUrl: readPhotoFromFields(r.fields)
-      }
-    });
+    const item = {
+      id: r.id,
+      name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+      category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+      brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+      color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+      imageUrl: readPhotoFromFields(r.fields),
+      source: 'mine',
+      ownerUserId: uid
+    };
+    res.json({ data: item, item });
   } catch (err) { next(err); }
 });
 
-// ------- Closet: delete (only your own) -------
+// ------- Closet: delete (only your own; unified user id) -------
 app.delete('/api/closet/:id', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUid(req);
+    const uid = requireUserId(req);
     const current = await tbCloset.find(req.params.id);
     if ((current.fields[USER_ID_FIELD] || '') !== uid) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your item' } });
@@ -500,7 +548,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
         [OUTFITS_WEATHER_FIELD]: weather || '',
         [OUTFITS_REASON_FIELD]: o.reasoning || '',
         [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : '',
-        [USER_ID_FIELD]: getUid(req)
+        [USER_ID_FIELD]: getUserId(req)
       };
       if (o.preview) {
         if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
@@ -556,7 +604,7 @@ app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
 // ------- Outfits: archive list (scoped to user) -------
 app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUid(req);
+    const uid = getUserId(req);
     const recs = await tbOutfits.select({
       pageSize: 100,
       filterByFormula: `{${USER_ID_FIELD}}='${esc(uid)}'`
@@ -601,7 +649,7 @@ app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
 // ------- Outfits: delete saved look -------
 app.delete('/api/outfits/:id', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUid(req);
+    const uid = requireUserId(req);
     const curr = await tbOutfits.find(req.params.id);
     if ((curr.fields[USER_ID_FIELD] || '') !== uid) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your look' } });
