@@ -142,6 +142,25 @@ async function fetchClosetItemsByIds(ids = []) {
   return out;
 }
 
+// --- Robust photo readers/writers ---
+const PHOTO_FIELD_CANDIDATES = [
+  CLOSET_PHOTO_FIELD,
+  'Photo', 'Photos',
+  'Image', 'Images',
+  'Image URL', 'Image Url', 'Photo URL',
+  'Picture', 'Pictures'
+];
+
+function readPhotoFromFields(fields) {
+  for (const key of PHOTO_FIELD_CANDIDATES) {
+    if (!key) continue;
+    const val = readField(fields, key, []);
+    const url = firstUrl(val);
+    if (url) return url;
+  }
+  return undefined;
+}
+
 // ---------- SCHEMAS ----------
 const OutfitSuggestSchema = z.object({
   userId: z.string().optional(),
@@ -209,7 +228,7 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
       category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
       color: readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
       brand: readField(i.fields, CLOSET_BRAND_FIELD, ['Brand']) || '',
-      photo: firstUrl(readField(i.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']))
+      photo: readPhotoFromFields(i.fields)
     })),
     count: topK
   };
@@ -353,7 +372,6 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
     const records = await tbCloset.select(cfg).all();
 
     const data = records.map(r => {
-      const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
       const owner = String(readField(r.fields, CLOSET_USER_FIELD, [USER_ID_FIELD]) || '').trim();
       return {
         id: r.id,
@@ -361,9 +379,9 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
         category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
         brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
         color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-        imageUrl: firstUrl(rawPhoto),
-        source: owner ? 'mine' : 'catalog',          // helpful for the app (optional)
-        ownerUserId: owner || ''                      // optional: expose owner id
+        imageUrl: readPhotoFromFields(r.fields),
+        source: owner ? 'mine' : 'catalog',
+        ownerUserId: owner || ''
       };
     });
 
@@ -387,6 +405,8 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
     if (imageUrl) {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
       else fields[CLOSET_PHOTO_FIELD] = imageUrl;
+      // Mirror to a plain URL column too (safe even if it doesn't exist)
+      fields['Image URL'] = imageUrl;
     }
 
     const recs = await tbCloset.create([{ fields }], { typecast: true });
@@ -415,11 +435,12 @@ app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
     if (patch.imageUrl !== undefined) {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = patch.imageUrl ? [{ url: patch.imageUrl }] : [];
       else fields[CLOSET_PHOTO_FIELD] = patch.imageUrl || '';
+      // Keep the plain URL mirror in sync
+      fields['Image URL'] = patch.imageUrl || '';
     }
 
     const recs = await tbCloset.update([{ id: req.params.id, fields }], { typecast: true });
     const r = recs[0];
-    const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
     res.json({
       data: {
         id: r.id,
@@ -427,7 +448,7 @@ app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
         category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
         brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
         color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-        imageUrl: firstUrl(rawPhoto)
+        imageUrl: readPhotoFromFields(r.fields)
       }
     });
   } catch (err) { next(err); }
@@ -558,7 +579,7 @@ app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
     const catalog = {};
     for (const it of items) {
       const name = readField(it.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '';
-      const photo = firstUrl(readField(it.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']));
+      const photo = readPhotoFromFields(it.fields);
       if (name) catalog[name] = { photoUrl: photo };
     }
 
