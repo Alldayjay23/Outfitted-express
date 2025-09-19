@@ -380,11 +380,12 @@ app.post('/api/closet/describe', requireApiKey, async (req, res, next) => {
 });
 
 // ------- Closet: list/search (supports scope=mine|blended|catalog) -------
+// ------- Closet: list/search (supports scope=mine|blended|catalog) -------
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
     const uid = getUserId(req);
     const { q, limit = 200 } = req.query;
-    const scope = String(req.query.scope || 'blended').toLowerCase(); // NEW
+    const scope = String(req.query.scope || 'blended').toLowerCase();
 
     const nameFilter = q
       ? `FIND(LOWER("${esc(String(q).toLowerCase())}"), LOWER({${CLOSET_NAME_FIELD}}))`
@@ -402,8 +403,13 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
         : `{${CLOSET_USER_FIELD}}=BLANK()`;
     }
 
+    // ✅ Airtable pageSize must be <= 100. Use maxRecords for the total cap.
+    const requested   = parseInt(String(limit), 10) || 100;
+    const pageSize    = Math.min(Math.max(requested, 1), 100);   // 1..100
+    const maxRecords  = Math.min(Math.max(requested, 1), 1000);  // cap total fetched
+
+    const cfg = { pageSize, maxRecords };
     const filters = [nameFilter, scopeFilter].filter(Boolean);
-    const cfg = { pageSize: Math.min(Number(limit) || 200, 200) };
     cfg.filterByFormula = filters.length === 1 ? filters[0] : `AND(${filters.join(',')})`;
 
     const records = await tbCloset.select(cfg).all();
@@ -423,9 +429,10 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
     });
 
     res.set('Cache-Control', 'no-store');
-    res.json({ count: items.length, items, data: items }); // dual shape
+    res.json({ count: items.length, items, data: items });
   } catch (err) { next(err); }
 });
+
 
 // ------- Closet: create (stores user id; typecast true; normalized response) -------
 app.post('/api/closet', requireApiKey, async (req, res, next) => {
