@@ -390,7 +390,7 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
       else fields[CLOSET_PHOTO_FIELD] = imageUrl;
     }
-    const recs = await tbCloset.create([{ fields }]);
+    const recs = await tbCloset.create([{ fields }], { typecast: true });
     const r = recs[0];
     res.status(201).json({
       data: { id: r.id, name, category, color, brand, imageUrl: imageUrl || '' }
@@ -412,7 +412,7 @@ app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
       else fields[CLOSET_PHOTO_FIELD] = patch.imageUrl || '';
     }
 
-    const recs = await tbCloset.update([{ id: req.params.id, fields }]);
+    const recs = await tbCloset.update([{ id: req.params.id, fields }], { typecast: true });
     const r = recs[0];
     const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
     res.json({
