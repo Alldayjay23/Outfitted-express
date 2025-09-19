@@ -63,6 +63,10 @@ const {
   CLOUDINARY_FOLDER = 'outfitted'
 } = process.env;
 
+// --- User scoping ---
+const USER_ID_FIELD = 'User Id'; // Airtable text field in BOTH tables
+const getUid = (req) => String(req.header('x-user-id') || '').trim();
+
 if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
 if (!OPENAI_API_KEY && String(SKIP_OPENAI).toLowerCase() !== 'true') { console.error('⚠️ Missing OPENAI_API_KEY'); process.exit(1); }
 if (!API_KEY) { console.error('⚠️ Missing API_KEY'); process.exit(1); }
@@ -357,35 +361,49 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
 });
 
 // ------- Closet: get single -------
-app.get('/api/closet/:id', requireApiKey, async (req, res, next) => {
+app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
-    const rec = await tbCloset.find(req.params.id);
-    const rawPhoto = readField(rec.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
-    res.json({
-      data: {
-        id: rec.id,
-        name: readField(rec.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-        category: readField(rec.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-        brand: readField(rec.fields, CLOSET_BRAND_FIELD, ['Brand']),
-        color: readField(rec.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+    const { q, limit = 200 } = req.query;
+    const uid = getUid(req);
+    const cfg = { pageSize: Math.min(Number(limit) || 200, 200) };
+
+    // Always scope to this user
+    const filters = [`{${USER_ID_FIELD}}='${uid}'`];
+    if (q) {
+      filters.push(`FIND(LOWER("${String(q).toLowerCase()}"), LOWER({${CLOSET_NAME_FIELD}}))`);
+    }
+    cfg.filterByFormula = filters.length > 1 ? `AND(${filters.join(',')})` : filters[0];
+
+    const records = await tbCloset.select(cfg).all();
+
+    const data = records.map(r => {
+      const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
+      return {
+        id: r.id,
+        name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+        category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+        brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+        color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
         imageUrl: firstUrl(rawPhoto)
-      }
+      };
     });
+
+    res.json({ data });
   } catch (err) { next(err); }
 });
 
 // ------- Closet: create (stores user id) -------
 app.post('/api/closet', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUserId(req);
+    const uid = getUid(req);
     const { name, category, color, brand, imageUrl } = CreateClosetItemSchema.parse(req.body);
     const fields = {
       [CLOSET_NAME_FIELD]: name,
       [CLOSET_CATEGORY_FIELD]: category,
       [CLOSET_COLOR_FIELD]: color || '',
-      [CLOSET_BRAND_FIELD]: brand || ''
+      [CLOSET_BRAND_FIELD]: brand || '',
+      [USER_ID_FIELD]: uid
     };
-    if (uid) fields[CLOSET_USER_FIELD] = uid;
     if (imageUrl) {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
       else fields[CLOSET_PHOTO_FIELD] = imageUrl;
@@ -401,6 +419,12 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
 // ------- Closet: update -------
 app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
   try {
+    const uid = getUid(req);
+    const current = await tbCloset.find(req.params.id);
+    if ((current.fields[USER_ID_FIELD] || '') !== uid) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your item' } });
+    }
+
     const patch = UpdateClosetItemSchema.parse(req.body);
     const fields = {};
     if (patch.name != null)     fields[CLOSET_NAME_FIELD] = patch.name;
@@ -431,21 +455,14 @@ app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
 // ------- Closet: delete -------
 app.delete('/api/closet/:id', requireApiKey, async (req, res, next) => {
   try {
-    // Airtable SDK accepts a single id or array
+    const uid = getUid(req);
+    const current = await tbCloset.find(req.params.id);
+    if ((current.fields[USER_ID_FIELD] || '') !== uid) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your item' } });
+    }
     await tbCloset.destroy(req.params.id);
     res.status(204).send();
   } catch (err) { next(err); }
-});
-
-// ------- AI: describe clothing from an image -------
-app.post('/api/closet/describe', requireApiKey, async (req, res) => {
-  try {
-    const { imageUrl } = DescribeSchema.parse(req.body);
-    const info = await describeImage({ imageUrl });
-    res.json({ data: info });
-  } catch (e) {
-    res.status(500).json({ error: { code: 'DESCRIBE_FAILED', message: e?.message || 'Describe error' } });
-  }
 });
 
 // ------- Suggest outfits (stub if SKIP_OPENAI=true) -------
@@ -475,6 +492,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     for (const o of outfits) {
       const fields = {
         [OUTFITS_NAME_FIELD]: o.name,
+        [USER_ID_FIELD] = getUid(req);
         [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
         [OUTFITS_OCCASION_FIELD]: occasion,
         [OUTFITS_STYLE_FIELD]: style || '',
@@ -513,6 +531,7 @@ app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
       [OUTFITS_NAME_FIELD]: title,
       [OUTFITS_ITEMS_FIELD]: itemIds,
       [OUTFITS_OCCASION_FIELD]: occasion || '',
+      [USER_ID_FIELD] = getUid(req);
       [OUTFITS_STYLE_FIELD]: style || '',
       [OUTFITS_WEATHER_FIELD]: weather || '',
       [OUTFITS_REASON_FIELD]: reasoning || '',
@@ -536,12 +555,12 @@ app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
 // ------- Outfits: archive list (scoped to user) -------
 app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
   try {
-    const uid = getUserId(req);
-    const cfg = { pageSize: 100 };
-    if (uid) cfg.filterByFormula = `{${OUTFITS_USER_FIELD}} = '${esc(uid)}'`;
-    const recs = await tbOutfits.select(cfg).all();
+    const uid = getUid(req);
+    const recs = await tbOutfits.select({
+      pageSize: 100,
+      filterByFormula: `{${USER_ID_FIELD}}='${uid}'`
+    }).all();
 
-    // Build catalog map and normalize outfits
     const outfits = [];
     const needClosetIds = new Set();
     recs.forEach(r => {
@@ -563,7 +582,6 @@ app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
       if (name) catalog[name] = { photoUrl: photo };
     }
 
-    // Return outfits with item NAMES (not just IDs) so the app renders nicely
     const closetById = new Map(items.map(i => [i.id, i]));
     const normalized = outfits.map(o => ({
       id: o.id,
@@ -579,9 +597,15 @@ app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
 // ------- Outfits: delete saved look -------
 app.delete('/api/outfits/:id', requireApiKey, async (req, res, next) => {
   try {
+    const uid = getUid(req);
+    const curr = await tbOutfits.find(req.params.id);
+    if ((curr.fields[USER_ID_FIELD] || '') !== uid) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your look' } });
+    }
     await tbOutfits.destroy(req.params.id);
     res.status(204).send();
   } catch (err) { next(err); }
