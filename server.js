@@ -10,6 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import Airtable from 'airtable';
 import { z } from 'zod';
 import OpenAI from 'openai';
+import crypto from 'crypto'; // Cloudinary signature
 
 // ---------- PROCESS SAFETY ----------
 process.on('unhandledRejection', (err) => { console.error('UNHANDLED_REJECTION', err); });
@@ -51,7 +52,13 @@ const {
   OUTFITS_PHOTO_AS_ATTACHMENT = 'true',
 
   // Optional: bypass OpenAI for debugging
-  SKIP_OPENAI = 'false'
+  SKIP_OPENAI = 'false',
+
+  // Cloudinary
+  CLOUDINARY_CLOUD_NAME,
+  CLOUDINARY_API_KEY,
+  CLOUDINARY_API_SECRET,
+  CLOUDINARY_FOLDER = 'outfitted'
 } = process.env;
 
 if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) { console.error('⚠️ Missing Airtable creds'); process.exit(1); }
@@ -152,6 +159,13 @@ const CreateClosetItemSchema = z.object({
   brand: z.string().optional(),
   imageUrl: z.string().url().optional()
 });
+const UpdateClosetItemSchema = z.object({
+  name: z.string().min(1).optional(),
+  category: z.string().min(1).optional(),
+  color: z.string().optional().nullable(),
+  brand: z.string().optional().nullable(),
+  imageUrl: z.string().url().optional().nullable()
+});
 const CreateOrderSchema = z.object({
   userId: z.string().min(1),
   outfitId: z.string().min(1),
@@ -211,12 +225,10 @@ ${JSON.stringify(user, null, 2)}
         { role: 'user',  content: prompt }
       ]
     });
-
     const text =
       r.output_text ||
       (Array.isArray(r.output) ? r.output.flatMap(o => (o?.content || []).map(c => c?.text || '')).join('') : '') ||
       '';
-
     const parsed = extractJson(text);
     if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
     if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
@@ -291,6 +303,24 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ------- Closet: get single -------
+app.get('/api/closet/:id', requireApiKey, async (req, res, next) => {
+  try {
+    const rec = await tbCloset.find(req.params.id);
+    const rawPhoto = readField(rec.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
+    res.json({
+      data: {
+        id: rec.id,
+        name: readField(rec.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+        category: readField(rec.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+        brand: readField(rec.fields, CLOSET_BRAND_FIELD, ['Brand']),
+        color: readField(rec.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+        imageUrl: firstUrl(rawPhoto)
+      }
+    });
+  } catch (err) { next(err); }
+});
+
 // ------- Closet: create (simple URL upload) -------
 app.post('/api/closet', requireApiKey, async (req, res, next) => {
   try {
@@ -308,12 +338,46 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
     const recs = await tbCloset.create([{ fields }]);
     const r = recs[0];
     res.status(201).json({
+      data: { id: r.id, name, category, color, brand, imageUrl: imageUrl || '' }
+    });
+  } catch (err) { next(err); }
+});
+
+// ------- Closet: update -------
+app.put('/api/closet/:id', requireApiKey, async (req, res, next) => {
+  try {
+    const patch = UpdateClosetItemSchema.parse(req.body);
+    const fields = {};
+    if (patch.name != null)     fields[CLOSET_NAME_FIELD] = patch.name;
+    if (patch.category != null) fields[CLOSET_CATEGORY_FIELD] = patch.category;
+    if (patch.color != null)    fields[CLOSET_COLOR_FIELD] = patch.color || '';
+    if (patch.brand != null)    fields[CLOSET_BRAND_FIELD] = patch.brand || '';
+    if (patch.imageUrl !== undefined) {
+      if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = patch.imageUrl ? [{ url: patch.imageUrl }] : [];
+      else fields[CLOSET_PHOTO_FIELD] = patch.imageUrl || '';
+    }
+
+    const recs = await tbCloset.update([{ id: req.params.id, fields }]);
+    const r = recs[0];
+    const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
+    res.json({
       data: {
         id: r.id,
-        name, category, color, brand,
-        imageUrl: imageUrl || ''
+        name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+        category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+        brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
+        color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
+        imageUrl: firstUrl(rawPhoto)
       }
     });
+  } catch (err) { next(err); }
+});
+
+// ------- Closet: delete -------
+app.delete('/api/closet/:id', requireApiKey, async (req, res, next) => {
+  try {
+    await tbCloset.destroy(req.params.id);
+    res.status(204).send();
   } catch (err) { next(err); }
 });
 
@@ -441,6 +505,34 @@ app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
 
     res.json({ outfits: normalized, catalog });
   } catch (err) { next(err); }
+});
+
+// ------- Cloudinary signing endpoint -------
+app.post('/api/uploads/cloudinary/sign', requireApiKey, async (req, res) => {
+  try {
+    if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+      return res.status(500).json({ error: { code: 'NO_CLOUDINARY', message: 'Cloudinary env vars missing' } });
+    }
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder = CLOUDINARY_FOLDER || 'outfitted';
+    const paramsToSign = { folder, timestamp };
+    const toSign =
+      Object.keys(paramsToSign)
+        .sort()
+        .map(k => `${k}=${paramsToSign[k]}`)
+        .join('&') + CLOUDINARY_API_SECRET;
+    const signature = crypto.createHash('sha1').update(toSign).digest('hex');
+
+    return res.json({
+      cloudName: CLOUDINARY_CLOUD_NAME,
+      apiKey: CLOUDINARY_API_KEY,
+      timestamp,
+      signature,
+      folder
+    });
+  } catch (e) {
+    res.status(500).json({ error: { code: 'SIGN_FAILED', message: e?.message || 'Sign error' } });
+  }
 });
 
 // ------- Orders (idempotent) -------
