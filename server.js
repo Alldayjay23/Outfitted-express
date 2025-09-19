@@ -12,13 +12,8 @@ import { z } from 'zod';
 import OpenAI from 'openai';
 
 // ---------- PROCESS SAFETY ----------
-process.on('unhandledRejection', (err) => {
-  console.error('UNHANDLED_REJECTION', err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT_EXCEPTION', err);
-  process.exit(1);
-});
+process.on('unhandledRejection', (err) => { console.error('UNHANDLED_REJECTION', err); });
+process.on('uncaughtException', (err) => { console.error('UNCAUGHT_EXCEPTION', err); process.exit(1); });
 
 // ---------- ENV ----------
 const {
@@ -40,12 +35,12 @@ const {
   CLOSET_CATEGORY_FIELD = 'Category',
   CLOSET_BRAND_FIELD = 'Brand',
   CLOSET_COLOR_FIELD = 'Color',
-  CLOSET_PHOTO_FIELD = 'Photo',
+  CLOSET_PHOTO_FIELD = 'Photo',               // attachment or url
   CLOSET_PHOTO_AS_ATTACHMENT = 'true',
 
   // Outfits fields
   OUTFITS_NAME_FIELD = 'Title',
-  OUTFITS_ITEMS_FIELD = 'Items',
+  OUTFITS_ITEMS_FIELD = 'Items',              // linked to "Clothing Items"
   OUTFITS_PHOTO_FIELD = 'Photo',
   OUTFITS_STATUS_FIELD = 'Status',
   OUTFITS_REASON_FIELD = 'AI Reasoning',
@@ -68,7 +63,7 @@ const OUTFITS_PHOTO_IS_ATTACHMENT = String(OUTFITS_PHOTO_AS_ATTACHMENT).toLowerC
 
 // ---------- CORE ----------
 const app = express();
-app.set('trust proxy', 1); // behind Render/Cloudflare
+app.set('trust proxy', 1);
 
 const allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
@@ -119,8 +114,6 @@ function firstUrl(val) {
   if (typeof val === 'string') return val;                   // plain URL
   return undefined;
 }
-
-// Batch-resolve closet records by Airtable RECORD_ID()
 async function fetchClosetItemsByIds(ids = []) {
   if (!Array.isArray(ids) || !ids.length) return [];
   const out = [];
@@ -142,17 +135,29 @@ const OutfitSuggestSchema = z.object({
   itemIds: z.array(z.string()).nonempty('Provide itemIds from Clothing Items'),
   topK: z.number().int().min(1).max(5).default(1)
 });
-
-// New: saving an outfit (exact items chosen)
 const SaveOutfitSchema = z.object({
   title: z.string().min(1),
-  itemIds: z.array(z.string()).min(1),     // Airtable record IDs
+  itemIds: z.array(z.string()).min(1),
   occasion: z.string().optional(),
   style: z.string().optional(),
   weather: z.string().optional(),
   reasoning: z.string().optional(),
-  palette: z.array(z.string()).optional(), // e.g. ["navy","white"]
-  photoUrl: z.string().url().optional()    // optional preview
+  palette: z.array(z.string()).optional(),
+  photoUrl: z.string().url().optional()
+});
+const CreateClosetItemSchema = z.object({
+  name: z.string().min(1),
+  category: z.string().min(1),
+  color: z.string().optional(),
+  brand: z.string().optional(),
+  imageUrl: z.string().url().optional()
+});
+const CreateOrderSchema = z.object({
+  userId: z.string().min(1),
+  outfitId: z.string().min(1),
+  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
+  note: z.string().max(2000).optional().default(''),
+  idempotencyKey: z.string().min(1)
 });
 
 // ---------- OPENAI ----------
@@ -259,29 +264,26 @@ if (process.env.NODE_ENV !== 'production') {
   });
 }
 
-app.get('/', (req, res) => {
-  res.type('text').send('Outfitted API is running. Try GET /healthz');
-});
+app.get('/', (req, res) => res.type('text').send('Outfitted API is running. Try GET /healthz'));
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
 
-// List/search clothing items
+// ------- Closet: list/search -------
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
   try {
-    const { q, limit = 50 } = req.query;
-    const cfg = { pageSize: Math.min(Number(limit) || 50, 100) };
+    const { q, limit = 200 } = req.query;
+    const cfg = { pageSize: Math.min(Number(limit) || 200, 200) };
     if (q) cfg.filterByFormula = `FIND(LOWER("${String(q).toLowerCase()}"), LOWER({${CLOSET_NAME_FIELD}}))`;
     const records = await tbCloset.select(cfg).all();
 
     const data = records.map(r => {
       const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
-      const imageUrl = firstUrl(rawPhoto);
       return {
         id: r.id,
         name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
         category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
         brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
         color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-        imageUrl
+        imageUrl: firstUrl(rawPhoto)
       };
     });
 
@@ -289,7 +291,33 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Suggest outfits (stub when SKIP_OPENAI=true)
+// ------- Closet: create (simple URL upload) -------
+app.post('/api/closet', requireApiKey, async (req, res, next) => {
+  try {
+    const { name, category, color, brand, imageUrl } = CreateClosetItemSchema.parse(req.body);
+    const fields = {
+      [CLOSET_NAME_FIELD]: name,
+      [CLOSET_CATEGORY_FIELD]: category,
+      [CLOSET_COLOR_FIELD]: color || '',
+      [CLOSET_BRAND_FIELD]: brand || ''
+    };
+    if (imageUrl) {
+      if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
+      else fields[CLOSET_PHOTO_FIELD] = imageUrl;
+    }
+    const recs = await tbCloset.create([{ fields }]);
+    const r = recs[0];
+    res.status(201).json({
+      data: {
+        id: r.id,
+        name, category, color, brand,
+        imageUrl: imageUrl || ''
+      }
+    });
+  } catch (err) { next(err); }
+});
+
+// ------- Suggest outfits (stub if SKIP_OPENAI=true) -------
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   req.log.info('USING_STUB_SUGGEST');
   try {
@@ -299,13 +327,9 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     }
 
     const { occasion, weather, style, itemIds, topK } = parsed.data;
-
     const items = await fetchClosetItemsByIds(itemIds);
-    if (!items.length) {
-      return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
-    }
+    if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
-    // If AI is on, call it; else deterministic stub:
     const outfits = (String(SKIP_OPENAI).toLowerCase() === 'true')
       ? [{
           name: `${style ? `${style} ` : ''}${occasion} fit`.trim(),
@@ -339,28 +363,23 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Save an outfit with the exact items chosen by the client
+// ------- Outfits: save exact items -------
 app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
   try {
     const { title, itemIds, occasion, style, weather, reasoning, palette, photoUrl } =
       SaveOutfitSchema.parse(req.body);
 
-    // 1) Validate the items exist
+    // Validate the items exist
     const items = await fetchClosetItemsByIds(itemIds);
     if (items.length !== itemIds.length) {
       return res.status(400).json({
-        error: {
-          code: 'ITEMS_NOT_FOUND',
-          message: 'Some itemIds are invalid or missing in Airtable',
-          details: { requested: itemIds.length, found: items.length }
-        }
+        error: { code: 'ITEMS_NOT_FOUND', message: 'Some itemIds are invalid', details: { requested: itemIds.length, found: items.length } }
       });
     }
 
-    // 2) Build Airtable fields
     const fields = {
       [OUTFITS_NAME_FIELD]: title,
-      [OUTFITS_ITEMS_FIELD]: itemIds, // exact IDs the user picked
+      [OUTFITS_ITEMS_FIELD]: itemIds,
       [OUTFITS_OCCASION_FIELD]: occasion || '',
       [OUTFITS_STYLE_FIELD]: style || '',
       [OUTFITS_WEATHER_FIELD]: weather || '',
@@ -372,59 +391,77 @@ app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
       else fields[OUTFITS_PHOTO_FIELD] = photoUrl;
     }
 
-    // 3) Create record
     const recs = await tbOutfits.create([{ fields }]);
     const created = recs[0];
 
     return res.status(201).json({
-      data: {
-        id: created.id,
-        title,
-        items: itemIds,
-        occasion, style, weather, reasoning, palette, photoUrl
-      }
+      data: { id: created.id, title, items: itemIds, occasion, style, weather, reasoning, palette, photoUrl }
     });
   } catch (err) { next(err); }
 });
 
-// ---------- ORDERS (idempotent) ----------
-const CreateOrderSchema = z.object({
-  userId: z.string().min(1),
-  outfitId: z.string().min(1),
-  fulfillment: z.enum(['delivery', 'pickup', 'stylist']).default('delivery'),
-  note: z.string().max(2000).optional().default(''),
-  idempotencyKey: z.string().min(1)
+// ------- Outfits: archive list (for Saved Looks screen) -------
+app.get('/api/outfits/archive', requireApiKey, async (req, res, next) => {
+  try {
+    const recs = await tbOutfits.select({ pageSize: 100 }).all();
+
+    // Build catalog map and normalize outfits
+    const outfits = [];
+    const needClosetIds = new Set();
+    recs.forEach(r => {
+      const linkedIds = Array.isArray(r.fields[OUTFITS_ITEMS_FIELD]) ? r.fields[OUTFITS_ITEMS_FIELD] : [];
+      linkedIds.forEach(id => needClosetIds.add(id));
+      outfits.push({
+        id: r.id,
+        title: r.fields[OUTFITS_NAME_FIELD] || 'Saved outfit',
+        itemIds: linkedIds,
+        photo: firstUrl(r.fields[OUTFITS_PHOTO_FIELD]),
+      });
+    });
+
+    const items = await fetchClosetItemsByIds([...needClosetIds]);
+    const catalog = {};
+    for (const it of items) {
+      const name = readField(it.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '';
+      const photo = firstUrl(readField(it.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']));
+      if (name) catalog[name] = { photoUrl: photo };
+    }
+
+    // Return outfits with item NAMES (not just IDs) so the app renders nicely
+    const closetById = new Map(items.map(i => [i.id, i]));
+    const normalized = outfits.map(o => ({
+      id: o.id,
+      title: o.title,
+      items: o.itemIds
+        .map(id => closetById.get(id))
+        .filter(Boolean)
+        .map(rec => readField(rec.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item'])),
+      photo: o.photo || ''
+    }));
+
+    res.json({ outfits: normalized, catalog });
+  } catch (err) { next(err); }
 });
 
-// POST /api/orders  (idempotent via Idempotency Key)
+// ------- Orders (idempotent) -------
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
     const { userId, outfitId, fulfillment, note, idempotencyKey } =
       CreateOrderSchema.parse(req.body);
 
-    // 1) Idempotency check
     const safeKey = String(idempotencyKey).replace(/'/g, "\\'");
-    const existing = await tbOrders
-      .select({ maxRecords: 1, filterByFormula: `{Idempotency Key} = '${safeKey}'` })
-      .firstPage();
-
+    const existing = await tbOrders.select({ maxRecords: 1, filterByFormula: `{Idempotency Key} = '${safeKey}'` }).firstPage();
     if (existing.length) {
       const r = existing[0];
       return res.status(200).json({ data: { id: r.id, ...r.fields } });
     }
 
-    // 2) Validate outfit exists
     const outfit = await tbOutfits.find(outfitId).catch(() => null);
-    if (!outfit) {
-      return res
-        .status(404)
-        .json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
-    }
+    if (!outfit) return res.status(404).json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
 
-    // 3) Create order
     const fields = {
       'User Id': userId,
-      'Outfit': [outfitId],     // single linked record
+      'Outfit': [outfitId],
       'Status': 'pending',
       'Fulfillment': fulfillment,
       'Note': note || '',
@@ -433,42 +470,28 @@ app.post('/api/orders', requireApiKey, async (req, res, next) => {
 
     const recs = await tbOrders.create([{ fields }]);
     return res.status(201).json({ data: { id: recs[0].id, ...fields } });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
-// GET /api/orders/:id
 app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
   try {
     const rec = await tbOrders.find(req.params.id);
     res.json({ data: { id: rec.id, ...rec.fields } });
   } catch (err) {
-    if (String(err).includes('NOT_FOUND')) {
-      return res
-        .status(404)
-        .json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
-    }
+    if (String(err).includes('NOT_FOUND')) return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
     next(err);
   }
 });
+
 // ---------- ERROR HANDLER ----------
 /* eslint-disable no-unused-vars */
 app.use((err, req, res, next) => {
   const status = err.status || 500;
-  const payload = {
-    code: err.code || 'INTERNAL_ERROR',
-    message: err.message || 'Unexpected server error',
-    details: err.details,
-    requestId: req.id
-  };
+  const payload = { code: err.code || 'INTERNAL_ERROR', message: err.message || 'Unexpected server error', details: err.details, requestId: req.id };
   req.log.error({ err, status, path: req.path, requestId: req.id });
   res.status(status).json({ error: payload });
 });
 /* eslint-enable no-unused-vars */
 
 // ---------- BOOT ----------
-app.listen(PORT, () => {
-  console.log(`✅ Outfitted API on ${PORT} (${NODE_ENV})`);
-});
-
+app.listen(PORT, () => { console.log(`✅ Outfitted API on ${PORT} (${NODE_ENV})`); });
