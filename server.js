@@ -321,6 +321,16 @@ if (process.env.NODE_ENV !== 'production') {
 
 app.get('/', (req, res) => res.type('text').send('Outfitted API is running. Try GET /healthz'));
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', ts: Date.now() }));
+// AI: describe a clothing photo (used by the app's "AI: Auto-fill" button)
+app.post('/api/closet/describe', requireApiKey, async (req, res, next) => {
+  try {
+    const { imageUrl } = DescribeSchema.parse(req.body); // validates { imageUrl }
+    const data = await describeImage({ imageUrl });      // calls OpenAI (or stub if SKIP_OPENAI=true)
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ------- Closet: list/search (scoped: this user OR global blank) -------
 app.get('/api/closet', requireApiKey, async (req, res, next) => {
@@ -360,55 +370,23 @@ app.get('/api/closet', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ------- Closet: get single -------
-app.get('/api/closet', requireApiKey, async (req, res, next) => {
-  try {
-    const { q, limit = 200 } = req.query;
-    const uid = getUid(req);
-    const cfg = { pageSize: Math.min(Number(limit) || 200, 200) };
-
-    // Always scope to this user
-    const filters = [`{${USER_ID_FIELD}}='${uid}'`];
-    if (q) {
-      filters.push(`FIND(LOWER("${String(q).toLowerCase()}"), LOWER({${CLOSET_NAME_FIELD}}))`);
-    }
-    cfg.filterByFormula = filters.length > 1 ? `AND(${filters.join(',')})` : filters[0];
-
-    const records = await tbCloset.select(cfg).all();
-
-    const data = records.map(r => {
-      const rawPhoto = readField(r.fields, CLOSET_PHOTO_FIELD, ['Photo','Image URL']);
-      return {
-        id: r.id,
-        name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-        category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-        brand: readField(r.fields, CLOSET_BRAND_FIELD, ['Brand']),
-        color: readField(r.fields, CLOSET_COLOR_FIELD, ['Color','Colors']),
-        imageUrl: firstUrl(rawPhoto)
-      };
-    });
-
-    res.json({ data });
-  } catch (err) { next(err); }
-});
-
 // ------- Closet: create (stores user id) -------
 app.post('/api/closet', requireApiKey, async (req, res, next) => {
   try {
     const uid = getUid(req);
     const { name, category, color, brand, imageUrl } = CreateClosetItemSchema.parse(req.body);
     const fields = {
-      [CLOSET_NAME_FIELD]: name,
-      [CLOSET_CATEGORY_FIELD]: category,
-      [CLOSET_COLOR_FIELD]: color || '',
-      [CLOSET_BRAND_FIELD]: brand || '',
-      fields[USER_ID_FIELD]: uid
-    };
-    if (imageUrl) {
-      if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
-      else fields[CLOSET_PHOTO_FIELD] = imageUrl;
-    }
-    const recs = await tbCloset.create([{ fields }], { typecast: true });
+  [CLOSET_NAME_FIELD]: name,
+  [CLOSET_CATEGORY_FIELD]: category,
+  [CLOSET_COLOR_FIELD]: color || '',
+  [CLOSET_BRAND_FIELD]: brand || '',
+  [USER_ID_FIELD]: uid,             // ✅ correct computed property
+};
+if (imageUrl) {
+  if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
+  else fields[CLOSET_PHOTO_FIELD] = imageUrl;
+}
+const recs = await tbCloset.create([{ fields }], { typecast: true });
     const r = recs[0];
     res.status(201).json({
       data: { id: r.id, name, category, color, brand, imageUrl: imageUrl || '' }
@@ -491,20 +469,20 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const created = [];
     for (const o of outfits) {
       const fields = {
-        [OUTFITS_NAME_FIELD]: o.name,
-        fields[USER_ID_FIELD] = getUid(req);
-        [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
-        [OUTFITS_OCCASION_FIELD]: occasion,
-        [OUTFITS_STYLE_FIELD]: style || '',
-        [OUTFITS_WEATHER_FIELD]: weather || '',
-        [OUTFITS_REASON_FIELD]: o.reasoning || '',
-        [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : ''
-      };
-      if (o.preview) {
-        if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
-        else fields[OUTFITS_PHOTO_FIELD] = o.preview;
-      }
-      const rec = await tbOutfits.create([{ fields }]);
+  [OUTFITS_NAME_FIELD]: o.name,
+  [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
+  [OUTFITS_OCCASION_FIELD]: occasion,
+  [OUTFITS_STYLE_FIELD]: style || '',
+  [OUTFITS_WEATHER_FIELD]: weather || '',
+  [OUTFITS_REASON_FIELD]: o.reasoning || '',
+  [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : '',
+  [USER_ID_FIELD]: getUid(req),   // ✅ add user scope
+};
+if (o.preview) {
+  if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
+  else fields[OUTFITS_PHOTO_FIELD] = o.preview;
+}
+const rec = await tbOutfits.create([{ fields }], { typecast: true });
       created.push({ id: rec[0].id, fields });
     }
 
@@ -528,22 +506,20 @@ app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
     }
 
     const fields = {
-      [OUTFITS_NAME_FIELD]: title,
-      [OUTFITS_ITEMS_FIELD]: itemIds,
-      [OUTFITS_OCCASION_FIELD]: occasion || '',
-      [USER_ID_FIELD] = getUid(req);
-      [OUTFITS_STYLE_FIELD]: style || '',
-      [OUTFITS_WEATHER_FIELD]: weather || '',
-      [OUTFITS_REASON_FIELD]: reasoning || '',
-      [OUTFITS_PALETTE_FIELD]: Array.isArray(palette) ? palette.join(', ') : ''
-    };
-    if (uid) fields[OUTFITS_USER_FIELD] = uid;
-    if (photoUrl) {
-      if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: photoUrl }];
-      else fields[OUTFITS_PHOTO_FIELD] = photoUrl;
-    }
-
-    const recs = await tbOutfits.create([{ fields }]);
+  [OUTFITS_NAME_FIELD]: title,
+  [OUTFITS_ITEMS_FIELD]: itemIds,
+  [OUTFITS_OCCASION_FIELD]: occasion || '',
+  [OUTFITS_STYLE_FIELD]: style || '',
+  [OUTFITS_WEATHER_FIELD]: weather || '',
+  [OUTFITS_REASON_FIELD]: reasoning || '',
+  [OUTFITS_PALETTE_FIELD]: Array.isArray(palette) ? palette.join(', ') : '',
+  [USER_ID_FIELD]: uid,            // ✅ add user scope
+};
+if (photoUrl) {
+  if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: photoUrl }];
+  else fields[OUTFITS_PHOTO_FIELD] = photoUrl;
+}
+const recs = await tbOutfits.create([{ fields }], { typecast: true });
     const created = recs[0];
 
     return res.status(201).json({
