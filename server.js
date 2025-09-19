@@ -402,7 +402,7 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
       [CLOSET_CATEGORY_FIELD]: category,
       [CLOSET_COLOR_FIELD]: color || '',
       [CLOSET_BRAND_FIELD]: brand || '',
-      [USER_ID_FIELD]: uid
+      fields[USER_ID_FIELD]: uid
     };
     if (imageUrl) {
       if (CLOSET_PHOTO_IS_ATTACHMENT) fields[CLOSET_PHOTO_FIELD] = [{ url: imageUrl }];
@@ -492,7 +492,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     for (const o of outfits) {
       const fields = {
         [OUTFITS_NAME_FIELD]: o.name,
-        [USER_ID_FIELD] = getUid(req);
+        fields[USER_ID_FIELD] = getUid(req);
         [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
         [OUTFITS_OCCASION_FIELD]: occasion,
         [OUTFITS_STYLE_FIELD]: style || '',
