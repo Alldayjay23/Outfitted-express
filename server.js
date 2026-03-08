@@ -551,6 +551,50 @@ app.get('/api/listings', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ------- Listings: create -------
+app.post('/api/listings', requireApiKey, async (req, res, next) => {
+  try {
+    const uid = getUserId(req);
+    const { name, price, size, condition, description, sellerName, imageUrl } = req.body;
+
+    if (!name || typeof name !== 'string') {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'name is required' } });
+    }
+    if (typeof price !== 'number' || price <= 0) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'price must be a positive number' } });
+    }
+
+    const fields = {
+      'Name':        name,
+      'Price':       price,
+      'Status':      'Active',
+    };
+    if (size)        fields['Size']        = size;
+    if (condition)   fields['Condition']   = condition;
+    if (description) fields['Description'] = description;
+    if (uid)         fields['Seller ID']   = uid;
+    if (sellerName)  fields['Seller Name'] = sellerName;
+    if (imageUrl)    fields['Image URL']   = imageUrl;
+
+    const recs = await tbListings.create([{ fields }], { typecast: true });
+    const r = recs[0];
+
+    res.status(201).json({
+      id:          r.id,
+      name:        r.fields['Name']        ?? null,
+      price:       r.fields['Price']       ?? price,
+      size:        r.fields['Size']        ?? null,
+      category:    r.fields['Category']    ?? null,
+      condition:   r.fields['Condition']   ?? null,
+      description: r.fields['Description'] ?? null,
+      imageUrl:    r.fields['Image URL']   ?? null,
+      sellerId:    r.fields['Seller ID']   ?? null,
+      sellerName:  r.fields['Seller Name'] ?? null,
+      status:      r.fields['Status']      ?? 'Active',
+    });
+  } catch (err) { next(err); }
+});
+
 // ------- Suggest outfits (stub if SKIP_OPENAI=true) -------
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   req.log.info('USING_STUB_SUGGEST');
