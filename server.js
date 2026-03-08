@@ -595,6 +595,38 @@ app.post('/api/listings', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ------- Listings: edit (price, condition, description) -------
+app.patch('/api/listings/:id', requireApiKey, async (req, res, next) => {
+  try {
+    const { price, condition, description } = req.body;
+    const fields = {};
+    if (price       !== undefined) fields['Price']       = price;
+    if (condition   !== undefined) fields['Condition']   = condition;
+    if (description !== undefined) fields['Description'] = description;
+
+    if (Object.keys(fields).length === 0) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'No updatable fields provided' } });
+    }
+
+    const r = await tbListings.update(req.params.id, fields);
+    res.json({
+      id:          r.id,
+      price:       r.fields['Price']       ?? null,
+      condition:   r.fields['Condition']   ?? null,
+      description: r.fields['Description'] ?? null,
+      status:      r.fields['Status']      ?? null,
+    });
+  } catch (err) { next(err); }
+});
+
+// ------- Listings: unlist (set status Inactive) -------
+app.delete('/api/listings/:id', requireApiKey, async (req, res, next) => {
+  try {
+    await tbListings.update(req.params.id, { 'Status': 'Inactive' });
+    res.status(204).send();
+  } catch (err) { next(err); }
+});
+
 // ------- Suggest outfits (stub if SKIP_OPENAI=true) -------
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   req.log.info('USING_STUB_SUGGEST');
