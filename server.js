@@ -622,7 +622,7 @@ app.patch('/api/listings/:id', requireApiKey, async (req, res, next) => {
 // ------- Listings: unlist (set status Inactive) -------
 app.delete('/api/listings/:id', requireApiKey, async (req, res, next) => {
   try {
-    await tbListings.update(req.params.id, { 'Status': 'Inactive' });
+    await tbListings.update(req.params.id, { 'Status': 'Sold' });
     res.status(204).send();
   } catch (err) { next(err); }
 });
