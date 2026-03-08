@@ -534,16 +534,16 @@ app.get('/api/listings', requireApiKey, async (req, res, next) => {
 
     const listings = records.map(r => ({
       id:          r.id,
-      name:        r.fields.name        ?? null,
-      price:       r.fields.price       ?? 0,
-      size:        r.fields.size        ?? null,
-      category:    r.fields.category    ?? null,
-      condition:   r.fields.condition   ?? null,
-      description: r.fields.description ?? null,
-      imageUrl:    r.fields.imageUrl    ?? null,  // plain URL text field
-      sellerId:    r.fields.sellerId    ?? null,
-      sellerName:  r.fields.sellerName  ?? null,
-      status:      r.fields.status      ?? null,
+      name:        r.fields['Name']        ?? null,
+      price:       r.fields['Price']       ?? 0,
+      size:        r.fields['Size']        ?? null,
+      category:    r.fields['Category']    ?? null,
+      condition:   r.fields['Condition']   ?? null,
+      description: r.fields['Description'] ?? null,
+      imageUrl:    r.fields['Image URL']   ?? null,
+      sellerId:    r.fields['Seller ID']   ?? null,
+      sellerName:  r.fields['Seller Name'] ?? null,
+      status:      r.fields['Status']      ?? null,
     }));
 
     res.set('Cache-Control', 'no-store');
