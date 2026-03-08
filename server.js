@@ -26,6 +26,7 @@ const {
   AIRTABLE_TABLE_CLOSET = 'Clothing Items',
   AIRTABLE_TABLE_OUTFITS = 'Outfits',
   AIRTABLE_TABLE_ORDERS = 'Orders',
+  AIRTABLE_TABLE_LISTINGS = 'Listings',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o-mini',
   API_KEY,
@@ -128,9 +129,10 @@ function requireApiKey(req, res, next) {
 
 // ---------- CLIENTS ----------
 const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
-const tbCloset  = base(AIRTABLE_TABLE_CLOSET);
-const tbOutfits = base(AIRTABLE_TABLE_OUTFITS);
-const tbOrders  = base(AIRTABLE_TABLE_ORDERS);
+const tbCloset   = base(AIRTABLE_TABLE_CLOSET);
+const tbOutfits  = base(AIRTABLE_TABLE_OUTFITS);
+const tbOrders   = base(AIRTABLE_TABLE_ORDERS);
+const tbListings = base(AIRTABLE_TABLE_LISTINGS);
 const openai    = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ---------- UTILS ----------
@@ -519,6 +521,33 @@ app.delete('/api/closet/:id', requireApiKey, async (req, res, next) => {
     }
     await tbCloset.destroy(req.params.id);
     res.status(204).send();
+  } catch (err) { next(err); }
+});
+
+// ------- Listings: public marketplace (no user filter) -------
+app.get('/api/listings', requireApiKey, async (req, res, next) => {
+  try {
+    const records = await tbListings.select({
+      filterByFormula: "{status} = 'Active'",
+      pageSize: 100
+    }).all();
+
+    const listings = records.map(r => ({
+      id:          r.id,
+      name:        r.fields.name        ?? null,
+      price:       r.fields.price       ?? 0,
+      size:        r.fields.size        ?? null,
+      category:    r.fields.category    ?? null,
+      condition:   r.fields.condition   ?? null,
+      description: r.fields.description ?? null,
+      imageUrl:    r.fields.imageUrl    ?? null,  // plain URL text field
+      sellerId:    r.fields.sellerId    ?? null,
+      sellerName:  r.fields.sellerName  ?? null,
+      status:      r.fields.status      ?? null,
+    }));
+
+    res.set('Cache-Control', 'no-store');
+    res.json(listings);
   } catch (err) { next(err); }
 });
 
