@@ -220,13 +220,6 @@ const UpdateClosetItemSchema = z.object({
 const DescribeSchema = z.object({
   imageUrl: z.string().url()
 });
-const CreateOrderSchema = z.object({
-  userId: z.string().min(1),
-  outfitId: z.string().min(1),
-  fulfillment: z.enum(['delivery','pickup','stylist']).default('delivery'),
-  note: z.string().max(2000).optional().default(''),
-  idempotencyKey: z.string().min(1)
-});
 
 // ---------- OPENAI ----------
 async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
@@ -799,44 +792,105 @@ app.post('/api/uploads/cloudinary/sign', requireApiKey, async (req, res) => {
   }
 });
 
-// ------- Orders (idempotent) -------
+// ------- Orders: create (listing checkout) -------
 app.post('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const { userId, outfitId, fulfillment, note, idempotencyKey } =
-      CreateOrderSchema.parse(req.body);
+    const buyerId = requireUserId(req);
+    const { listingId, listingName, price, sellerId, sellerName, imageUrl } = req.body;
 
-    const safeKey = String(idempotencyKey).replace(/'/g, "\\'");
-    const existing = await tbOrders.select({ maxRecords: 1, filterByFormula: `{Idempotency Key} = '${safeKey}'` }).firstPage();
-    if (existing.length) {
-      const r = existing[0];
-      return res.status(200).json({ data: { id: r.id, ...r.fields } });
+    if (!listingId || typeof listingId !== 'string') {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'listingId is required' } });
+    }
+    if (typeof price !== 'number' || price <= 0) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'price must be a positive number' } });
     }
 
-    const outfit = await tbOutfits.find(outfitId).catch(() => null);
-    if (!outfit) return res.status(404).json({ error: { code: 'OUTFIT_NOT_FOUND', message: 'Invalid outfitId' } });
-
     const fields = {
-      'User Id': userId,
-      'Outfit': [outfitId],
-      'Status': 'pending',
-      'Fulfillment': fulfillment,
-      'Note': note || '',
-      'Idempotency Key': idempotencyKey
+      'listingId':   listingId,
+      'listingName': listingName || '',
+      'price':       price,
+      'buyerId':     buyerId,
+      'sellerId':    sellerId  || '',
+      'sellerName':  sellerName || '',
+      'status':      'Pending',
+      'createdAt':   new Date().toISOString(),
+      'imageUrl':    imageUrl  || '',
     };
 
-    const recs = await tbOrders.create([{ fields }]);
-    return res.status(201).json({ data: { id: recs[0].id, ...fields } });
+    const recs = await tbOrders.create([{ fields }], { typecast: true });
+    const r = recs[0];
+
+    // Mark the listing Sold so it disappears from the marketplace
+    if (listingId) {
+      tbListings.update(listingId, { 'Status': 'Sold' }).catch((e) => {
+        req.log.warn({ msg: 'Failed to mark listing Sold', listingId, err: e.message });
+      });
+    }
+
+    res.status(201).json({
+      id:          r.id,
+      listingId:   r.fields['listingId']   ?? listingId,
+      listingName: r.fields['listingName'] ?? listingName,
+      price:       r.fields['price']       ?? price,
+      buyerId:     r.fields['buyerId']     ?? buyerId,
+      sellerId:    r.fields['sellerId']    ?? sellerId,
+      sellerName:  r.fields['sellerName']  ?? sellerName,
+      status:      r.fields['status']      ?? 'Pending',
+      createdAt:   r.fields['createdAt']   ?? fields.createdAt,
+      imageUrl:    r.fields['imageUrl']    ?? imageUrl,
+    });
   } catch (err) { next(err); }
 });
 
-app.get('/api/orders/:id', requireApiKey, async (req, res, next) => {
+// ------- Orders: fetch all for current user (buyer OR seller) -------
+app.get('/api/orders', requireApiKey, async (req, res, next) => {
   try {
-    const rec = await tbOrders.find(req.params.id);
-    res.json({ data: { id: rec.id, ...rec.fields } });
-  } catch (err) {
-    if (String(err).includes('NOT_FOUND')) return res.status(404).json({ error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' } });
-    next(err);
-  }
+    const uid = requireUserId(req);
+    const safeUid = esc(uid);
+
+    // Airtable doesn't support OR across two different text fields, so fetch both sides separately
+    const [buyerRecs, sellerRecs] = await Promise.all([
+      tbOrders.select({ filterByFormula: `{buyerId}  = '${safeUid}'`, pageSize: 100 }).all(),
+      tbOrders.select({ filterByFormula: `{sellerId} = '${safeUid}'`, pageSize: 100 }).all(),
+    ]);
+
+    const seen = new Set();
+    const normalise = (r) => {
+      if (seen.has(r.id)) return null;
+      seen.add(r.id);
+      return {
+        id:          r.id,
+        listingId:   r.fields['listingId']   ?? '',
+        listingName: r.fields['listingName'] ?? '',
+        price:       r.fields['price']       ?? 0,
+        buyerId:     r.fields['buyerId']     ?? '',
+        sellerId:    r.fields['sellerId']    ?? '',
+        sellerName:  r.fields['sellerName']  ?? '',
+        status:      r.fields['status']      ?? 'Pending',
+        createdAt:   r.fields['createdAt']   ?? '',
+        imageUrl:    r.fields['imageUrl']    ?? '',
+      };
+    };
+
+    const orders = [...buyerRecs, ...sellerRecs].map(normalise).filter(Boolean);
+    orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    res.set('Cache-Control', 'no-store');
+    res.json(orders);
+  } catch (err) { next(err); }
+});
+
+// ------- Orders: update status (seller progression only) -------
+app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
+  try {
+    const ALLOWED = ['Confirmed', 'Shipped', 'Delivered'];
+    const { status } = req.body;
+    if (!status || !ALLOWED.includes(status)) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: `status must be one of: ${ALLOWED.join(', ')}` } });
+    }
+    const r = await tbOrders.update(req.params.id, { 'status': status });
+    res.json({ id: r.id, status: r.fields['status'] ?? status });
+  } catch (err) { next(err); }
 });
 
 // ---------- ERROR HANDLER ----------
