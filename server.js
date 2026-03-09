@@ -806,15 +806,15 @@ app.post('/api/orders', requireApiKey, async (req, res, next) => {
     }
 
     const fields = {
-      'listingId':   listingId,
-      'listingName': listingName || '',
-      'price':       price,
-      'buyerId':     buyerId,
-      'sellerId':    sellerId  || '',
-      'sellerName':  sellerName || '',
-      'status':      'Pending',
-      'createdAt':   new Date().toISOString(),
-      'imageUrl':    imageUrl  || '',
+      'Listing ID':   listingId,
+      'Listing Name': listingName || '',
+      'Price':        price,
+      'Buyer ID':     buyerId,
+      'Seller ID':    sellerId   || '',
+      'Seller Name':  sellerName || '',
+      'Status':       'Pending',
+      'Created At':   new Date().toISOString(),
+      'Image URL':    imageUrl   || '',
     };
 
     const recs = await tbOrders.create([{ fields }], { typecast: true });
@@ -829,15 +829,15 @@ app.post('/api/orders', requireApiKey, async (req, res, next) => {
 
     res.status(201).json({
       id:          r.id,
-      listingId:   r.fields['listingId']   ?? listingId,
-      listingName: r.fields['listingName'] ?? listingName,
-      price:       r.fields['price']       ?? price,
-      buyerId:     r.fields['buyerId']     ?? buyerId,
-      sellerId:    r.fields['sellerId']    ?? sellerId,
-      sellerName:  r.fields['sellerName']  ?? sellerName,
-      status:      r.fields['status']      ?? 'Pending',
-      createdAt:   r.fields['createdAt']   ?? fields.createdAt,
-      imageUrl:    r.fields['imageUrl']    ?? imageUrl,
+      listingId:   r.fields['Listing ID']   ?? listingId,
+      listingName: r.fields['Listing Name'] ?? listingName,
+      price:       r.fields['Price']        ?? price,
+      buyerId:     r.fields['Buyer ID']     ?? buyerId,
+      sellerId:    r.fields['Seller ID']    ?? sellerId,
+      sellerName:  r.fields['Seller Name']  ?? sellerName,
+      status:      r.fields['Status']       ?? 'Pending',
+      createdAt:   r.fields['Created At']   ?? fields['Created At'],
+      imageUrl:    r.fields['Image URL']    ?? imageUrl,
     });
   } catch (err) { next(err); }
 });
@@ -850,8 +850,8 @@ app.get('/api/orders', requireApiKey, async (req, res, next) => {
 
     // Airtable doesn't support OR across two different text fields, so fetch both sides separately
     const [buyerRecs, sellerRecs] = await Promise.all([
-      tbOrders.select({ filterByFormula: `{buyerId}  = '${safeUid}'`, pageSize: 100 }).all(),
-      tbOrders.select({ filterByFormula: `{sellerId} = '${safeUid}'`, pageSize: 100 }).all(),
+      tbOrders.select({ filterByFormula: `{Buyer ID}  = '${safeUid}'`, pageSize: 100 }).all(),
+      tbOrders.select({ filterByFormula: `{Seller ID} = '${safeUid}'`, pageSize: 100 }).all(),
     ]);
 
     const seen = new Set();
@@ -860,15 +860,15 @@ app.get('/api/orders', requireApiKey, async (req, res, next) => {
       seen.add(r.id);
       return {
         id:          r.id,
-        listingId:   r.fields['listingId']   ?? '',
-        listingName: r.fields['listingName'] ?? '',
-        price:       r.fields['price']       ?? 0,
-        buyerId:     r.fields['buyerId']     ?? '',
-        sellerId:    r.fields['sellerId']    ?? '',
-        sellerName:  r.fields['sellerName']  ?? '',
-        status:      r.fields['status']      ?? 'Pending',
-        createdAt:   r.fields['createdAt']   ?? '',
-        imageUrl:    r.fields['imageUrl']    ?? '',
+        listingId:   r.fields['Listing ID']   ?? '',
+        listingName: r.fields['Listing Name'] ?? '',
+        price:       r.fields['Price']        ?? 0,
+        buyerId:     r.fields['Buyer ID']     ?? '',
+        sellerId:    r.fields['Seller ID']    ?? '',
+        sellerName:  r.fields['Seller Name']  ?? '',
+        status:      r.fields['Status']       ?? 'Pending',
+        createdAt:   r.fields['Created At']   ?? '',
+        imageUrl:    r.fields['Image URL']    ?? '',
       };
     };
 
@@ -888,8 +888,8 @@ app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
     if (!status || !ALLOWED.includes(status)) {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: `status must be one of: ${ALLOWED.join(', ')}` } });
     }
-    const r = await tbOrders.update(req.params.id, { 'status': status });
-    res.json({ id: r.id, status: r.fields['status'] ?? status });
+    const r = await tbOrders.update(req.params.id, { 'Status': status });
+    res.json({ id: r.id, status: r.fields['Status'] ?? status });
   } catch (err) { next(err); }
 });
 
