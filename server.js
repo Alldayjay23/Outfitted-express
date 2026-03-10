@@ -898,40 +898,66 @@ app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
 app.get('/api/retailers', requireApiKey, async (req, res, next) => {
   try {
     if (!RAPIDAPI_KEY) {
+      req.log.error({ msg: 'RAPIDAPI_KEY env var not set' });
       return res.status(503).json({ error: { code: 'NO_RAPIDAPI_KEY', message: 'RAPIDAPI_KEY env var not set' } });
     }
 
-    const query    = req.query.query    ? String(req.query.query)    : 'trending fashion';
-    const limit    = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 48);
+    const query = req.query.query ? String(req.query.query) : 'trending fashion';
+    const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 48);
 
     const params = new URLSearchParams({
-      store:      'US',
-      offset:     '0',
-      limit:      String(limit),
-      categoryId: '4209',   // ASOS "New In" — broadest default
-      country:    'US',
-      currency:   'USD',
-      lang:       'en-US',
-      q:          query,
+      store:    'US',
+      offset:   '0',
+      limit:    String(limit),
+      country:  'US',
+      currency: 'USD',
+      lang:     'en-US',
+      q:        query,
     });
 
-    const asosRes = await fetch(
-      `https://asos2.p.rapidapi.com/products/v2/list?${params.toString()}`,
-      {
-        method:  'GET',
-        headers: {
-          'X-RapidAPI-Key':  RAPIDAPI_KEY,
-          'X-RapidAPI-Host': 'asos2.p.rapidapi.com',
-        },
-      }
-    );
+    const asosUrl = `https://asos2.p.rapidapi.com/products/v2/list?${params.toString()}`;
+
+    req.log.info({
+      msg:       'ASOS API request',
+      url:       asosUrl,
+      keyPrefix: RAPIDAPI_KEY.slice(0, 8) + '...',
+    });
+
+    const asosRes = await fetch(asosUrl, {
+      method:  'GET',
+      headers: {
+        'X-RapidAPI-Key':  RAPIDAPI_KEY,
+        'X-RapidAPI-Host': 'asos2.p.rapidapi.com',
+      },
+    });
+
+    const asosBody = await asosRes.text().catch(() => '');
+
+    req.log.info({
+      msg:    'ASOS API response',
+      status: asosRes.status,
+      body:   asosBody.slice(0, 600),
+    });
 
     if (!asosRes.ok) {
-      const errText = await asosRes.text().catch(() => '');
-      return res.status(502).json({ error: { code: 'ASOS_API_ERROR', message: `ASOS API ${asosRes.status}`, details: errText.slice(0, 300) } });
+      req.log.error({
+        msg:    'ASOS API error',
+        status: asosRes.status,
+        body:   asosBody,
+      });
+      return res.status(502).json({
+        error: { code: 'ASOS_API_ERROR', message: `ASOS API ${asosRes.status}`, details: asosBody.slice(0, 300) },
+      });
     }
 
-    const data = await asosRes.json();
+    let data;
+    try {
+      data = JSON.parse(asosBody);
+    } catch (parseErr) {
+      req.log.error({ msg: 'ASOS API non-JSON response', body: asosBody.slice(0, 300) });
+      return res.status(502).json({ error: { code: 'ASOS_PARSE_ERROR', message: 'Non-JSON response from ASOS API', details: asosBody.slice(0, 300) } });
+    }
+
     const raw = Array.isArray(data?.products) ? data.products : [];
 
     const products = raw.map(item => ({
