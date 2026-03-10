@@ -894,7 +894,7 @@ app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ------- Retailers: ASOS product feed via RapidAPI -------
+// ------- Retailers: ASOS product feed via RapidAPI (asos10) -------
 app.get('/api/retailers', requireApiKey, async (req, res, next) => {
   try {
     if (!RAPIDAPI_KEY) {
@@ -902,20 +902,19 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
       return res.status(503).json({ error: { code: 'NO_RAPIDAPI_KEY', message: 'RAPIDAPI_KEY env var not set' } });
     }
 
-    const query = req.query.query ? String(req.query.query) : 'trending fashion';
+    const query = req.query.query ? String(req.query.query) : 'trending';
     const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 48);
 
     const params = new URLSearchParams({
-      store:    'US',
-      offset:   '0',
-      limit:    String(limit),
-      country:  'US',
-      currency: 'USD',
-      lang:     'en-US',
-      q:        query,
+      searchTerm: query,
+      store:      'US',
+      lang:       'en-US',
+      currency:   'USD',
+      sizeSchema: 'US',
+      limit:      String(limit),
     });
 
-    const asosUrl = `https://asos2.p.rapidapi.com/products/v2/list?${params.toString()}`;
+    const asosUrl = `https://asos10.p.rapidapi.com/api/v1/getProductListBySearchTerm?${params.toString()}`;
 
     req.log.info({
       msg:       'ASOS API request',
@@ -926,8 +925,8 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
     const asosRes = await fetch(asosUrl, {
       method:  'GET',
       headers: {
-        'X-RapidAPI-Key':  RAPIDAPI_KEY,
-        'X-RapidAPI-Host': 'asos2.p.rapidapi.com',
+        'x-rapidapi-key':  RAPIDAPI_KEY,
+        'x-rapidapi-host': 'asos10.p.rapidapi.com',
       },
     });
 
@@ -936,15 +935,11 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
     req.log.info({
       msg:    'ASOS API response',
       status: asosRes.status,
-      body:   asosBody.slice(0, 600),
+      body:   asosBody.slice(0, 800),
     });
 
     if (!asosRes.ok) {
-      req.log.error({
-        msg:    'ASOS API error',
-        status: asosRes.status,
-        body:   asosBody,
-      });
+      req.log.error({ msg: 'ASOS API error', status: asosRes.status, body: asosBody });
       return res.status(502).json({
         error: { code: 'ASOS_API_ERROR', message: `ASOS API ${asosRes.status}`, details: asosBody.slice(0, 300) },
       });
@@ -953,22 +948,46 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
     let data;
     try {
       data = JSON.parse(asosBody);
-    } catch (parseErr) {
+    } catch {
       req.log.error({ msg: 'ASOS API non-JSON response', body: asosBody.slice(0, 300) });
       return res.status(502).json({ error: { code: 'ASOS_PARSE_ERROR', message: 'Non-JSON response from ASOS API', details: asosBody.slice(0, 300) } });
     }
 
-    const raw = Array.isArray(data?.products) ? data.products : [];
+    // Log top-level keys so we can see the exact response shape in Render logs
+    req.log.info({ msg: 'ASOS API data keys', keys: Object.keys(data ?? {}) });
+
+    // asos10 may return: { data: { products: [...] } } | { data: [...] } | { products: [...] } | [...]
+    let raw = [];
+    if (Array.isArray(data))                         raw = data;
+    else if (Array.isArray(data?.data?.products))    raw = data.data.products;
+    else if (Array.isArray(data?.data))              raw = data.data;
+    else if (Array.isArray(data?.products))          raw = data.products;
+
+    req.log.info({ msg: 'ASOS raw product count', count: raw.length });
+    if (raw.length > 0) req.log.info({ msg: 'ASOS first product keys', keys: Object.keys(raw[0]) });
+
+    const resolvePrice = (item) => {
+      const v = item.price?.current?.value ?? item.price?.value ?? item.priceData?.current ?? item.currentPrice;
+      if (typeof v === 'number') return v;
+      if (typeof v === 'string') return parseFloat(v.replace(/[^0-9.]/g, '')) || 0;
+      return 0;
+    };
+
+    const resolveUrl = (item) => {
+      const raw = item.url ?? item.productUrl ?? item.link ?? '';
+      if (!raw) return null;
+      if (raw.startsWith('http')) return raw;
+      if (raw.startsWith('//'))   return `https:${raw}`;
+      return `https://www.asos.com${raw.startsWith('/') ? '' : '/'}${raw}`;
+    };
 
     const products = raw.map(item => ({
-      id:         String(item.id),
-      name:       item.name        ?? 'Unnamed product',
-      brand:      item.brand?.name ?? 'ASOS',
-      price:      item.price?.current?.value ?? 0,
-      imageUrl:   item.imageUrl    ?? null,
-      productUrl: item.url
-        ? (item.url.startsWith('//') ? `https:${item.url}` : item.url)
-        : null,
+      id:         String(item.id ?? item.productId ?? Math.random()),
+      name:       item.name ?? item.productName ?? item.title ?? 'Unnamed product',
+      brand:      item.brandName ?? item.brand?.name ?? item.brand ?? 'ASOS',
+      price:      resolvePrice(item),
+      imageUrl:   item.imageUrl ?? item.image ?? item.imageLink ?? null,
+      productUrl: resolveUrl(item),
       retailer:   'ASOS',
     }));
 
