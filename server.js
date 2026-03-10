@@ -21,6 +21,7 @@ const {
   PORT = 10000,
   NODE_ENV,
   LOG_LEVEL = 'info',
+  RAPIDAPI_KEY,
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID,
   AIRTABLE_TABLE_CLOSET = 'Clothing Items',
@@ -890,6 +891,63 @@ app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
     }
     const r = await tbOrders.update(req.params.id, { 'Status': status });
     res.json({ id: r.id, status: r.fields['Status'] ?? status });
+  } catch (err) { next(err); }
+});
+
+// ------- Retailers: ASOS product feed via RapidAPI -------
+app.get('/api/retailers', requireApiKey, async (req, res, next) => {
+  try {
+    if (!RAPIDAPI_KEY) {
+      return res.status(503).json({ error: { code: 'NO_RAPIDAPI_KEY', message: 'RAPIDAPI_KEY env var not set' } });
+    }
+
+    const query    = req.query.query    ? String(req.query.query)    : 'trending fashion';
+    const limit    = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 48);
+
+    const params = new URLSearchParams({
+      store:      'US',
+      offset:     '0',
+      limit:      String(limit),
+      categoryId: '4209',   // ASOS "New In" — broadest default
+      country:    'US',
+      currency:   'USD',
+      lang:       'en-US',
+      q:          query,
+    });
+
+    const asosRes = await fetch(
+      `https://asos2.p.rapidapi.com/products/v2/list?${params.toString()}`,
+      {
+        method:  'GET',
+        headers: {
+          'X-RapidAPI-Key':  RAPIDAPI_KEY,
+          'X-RapidAPI-Host': 'asos2.p.rapidapi.com',
+        },
+      }
+    );
+
+    if (!asosRes.ok) {
+      const errText = await asosRes.text().catch(() => '');
+      return res.status(502).json({ error: { code: 'ASOS_API_ERROR', message: `ASOS API ${asosRes.status}`, details: errText.slice(0, 300) } });
+    }
+
+    const data = await asosRes.json();
+    const raw = Array.isArray(data?.products) ? data.products : [];
+
+    const products = raw.map(item => ({
+      id:         String(item.id),
+      name:       item.name        ?? 'Unnamed product',
+      brand:      item.brand?.name ?? 'ASOS',
+      price:      item.price?.current?.value ?? 0,
+      imageUrl:   item.imageUrl    ?? null,
+      productUrl: item.url
+        ? (item.url.startsWith('//') ? `https:${item.url}` : item.url)
+        : null,
+      retailer:   'ASOS',
+    }));
+
+    res.set('Cache-Control', 'public, max-age=300'); // 5 min — reduce RapidAPI quota usage
+    res.json(products);
   } catch (err) { next(err); }
 });
 
