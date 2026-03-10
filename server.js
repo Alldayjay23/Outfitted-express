@@ -981,12 +981,20 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
       return `https://www.asos.com${raw.startsWith('/') ? '' : '/'}${raw}`;
     };
 
+    const resolveImageUrl = (item) => {
+      const v = item.imageUrl ?? item.image ?? item.imageLink ?? null;
+      if (!v) return null;
+      if (v.startsWith('images.asos-media.com')) return `https://${v}`;
+      if (v.startsWith('//')) return `https:${v}`;
+      return v;
+    };
+
     const products = raw.map(item => ({
       id:         String(item.id ?? item.productId ?? Math.random()),
       name:       item.name ?? item.productName ?? item.title ?? 'Unnamed product',
       brand:      item.brandName ?? item.brand?.name ?? item.brand ?? 'ASOS',
       price:      resolvePrice(item),
-      imageUrl:   item.imageUrl ?? item.image ?? item.imageLink ?? null,
+      imageUrl:   resolveImageUrl(item),
       productUrl: resolveUrl(item),
       retailer:   'ASOS',
     }));
