@@ -1055,15 +1055,17 @@ async function fetchEbayProducts(query, limit, offset, log) {
   if (raw.length > 0) log?.info({ msg: 'eBay first item keys', keys: Object.keys(raw[0]) });
   if (raw.length === 0) console.log('[eBay] WARNING: no itemSummaries — full response keys:', Object.keys(data ?? {}), '| body:', text.slice(0, 800));
 
-  return raw.map(item => ({
-    id:         String(item.itemId ?? Math.random()),
-    name:       item.title ?? 'Unnamed product',
-    brand:      item.brand ?? item.seller?.username ?? 'eBay Seller',
-    price:      parseFloat(item.price?.value ?? '0') || 0,
-    imageUrl:   item.image?.imageUrl ?? null,
-    productUrl: item.itemWebUrl ?? null,
-    retailer:   'eBay',
-  }));
+  return raw
+    .map(item => ({
+      id:         String(item.itemId ?? Math.random()),
+      name:       item.title ?? 'Unnamed product',
+      brand:      item.seller?.username ?? 'eBay Seller',
+      price:      parseFloat(item.price?.value ?? item.buyingOptions?.[0] ?? '0') || 0,
+      imageUrl:   item.image?.imageUrl ?? item.thumbnailImages?.[0]?.imageUrl ?? null,
+      productUrl: item.itemWebUrl ?? null,
+      retailer:   'eBay',
+    }))
+    .filter(item => item.imageUrl && item.productUrl);
 }
 
 // Fisher-Yates shuffle — blends eBay and ASOS results instead of grouping by source
