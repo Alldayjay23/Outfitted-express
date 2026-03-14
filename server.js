@@ -651,6 +651,20 @@ app.delete('/api/listings/:id', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Category normalization for outfit suggestion
+const CATEGORY_NORMALIZATION_MAP = {
+  tee: 'top', shirt: 'top', blouse: 'top', sweater: 'top', hoodie: 'top', tank: 'top', 'long sleeve': 'top',
+  jeans: 'bottom', pants: 'bottom', shorts: 'bottom', skirt: 'bottom', trousers: 'bottom', 'cargo pants': 'bottom',
+  jacket: 'outerwear', coat: 'outerwear', blazer: 'outerwear',
+  sneakers: 'shoes', boots: 'shoes', heels: 'shoes', sandals: 'shoes', 'running shoes': 'shoes',
+};
+
+function normalizeCategory(raw) {
+  if (!raw) return raw;
+  const lower = raw.toLowerCase().trim();
+  return CATEGORY_NORMALIZATION_MAP[lower] ?? raw;
+}
+
 // ------- Suggest outfits (stub if SKIP_OPENAI=true) -------
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   req.log.info('USING_STUB_SUGGEST');
@@ -664,6 +678,14 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const items = await fetchClosetItemsByIds(itemIds);
     if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
+    // Build AI-facing items with normalized categories; original item data is preserved for the response
+    const itemsForAI = items.map(item => {
+      const rawCat = readField(item.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '';
+      const normalizedCat = normalizeCategory(rawCat);
+      if (normalizedCat === rawCat) return item;
+      return { ...item, fields: { ...item.fields, [CLOSET_CATEGORY_FIELD]: normalizedCat } };
+    });
+
     const outfits = (String(SKIP_OPENAI).toLowerCase() === 'true')
       ? [{
           name: `${style ? `${style} ` : ''}${occasion} fit`.trim(),
@@ -672,7 +694,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
           palette: Array.from(new Set(items.map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim()).filter(Boolean))).slice(0,5),
           preview: ''
         }]
-      : await generateOutfitsWithAI({ items, occasion, weather, style, topK });
+      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK });
 
     const created = [];
     for (const o of outfits) {
