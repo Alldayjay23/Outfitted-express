@@ -65,6 +65,36 @@ const {
   CLOUDINARY_FOLDER = 'outfitted'
 } = process.env;
 
+// --- eBay OAuth token state (auto-refreshed, never hardcoded) ---
+let ebayAccessToken  = '';
+let tokenExpiresAt   = 0; // Unix ms — token is considered expired when Date.now() >= this
+
+async function refreshEbayToken() {
+  const clientId = process.env.EBAY_CLIENT_ID;
+  const certId   = process.env.EBAY_CERT_ID;
+  if (!clientId || !certId) {
+    throw new Error('EBAY_CLIENT_ID or EBAY_CERT_ID env vars not set');
+  }
+  console.log('[eBay] Refreshing access token — clientId present:', !!clientId, 'certId present:', !!certId);
+  const credentials = Buffer.from(`${clientId}:${certId}`).toString('base64');
+  const res  = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${credentials}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
+  });
+  const text = await res.text();
+  console.log('[eBay] Token refresh response status:', res.status, '| body preview:', text.slice(0, 200));
+  if (!res.ok) throw new Error(`eBay token refresh failed: ${res.status} ${text.slice(0, 200)}`);
+  const data = JSON.parse(text);
+  ebayAccessToken = data.access_token;
+  // Expire 5 minutes before the real expiry to give requests a buffer
+  tokenExpiresAt  = Date.now() + (data.expires_in - 300) * 1000;
+  console.log('[eBay] Token refreshed successfully, expires at:', new Date(tokenExpiresAt).toISOString());
+}
+
 // --- User scoping ---
 const USER_ID_FIELD = 'User Id'; // the column name actually used in Airtable
 
@@ -894,113 +924,201 @@ app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ------- Retailers: ASOS product feed via RapidAPI (asos10) -------
+// ------- Retailer source helpers -------
+
+async function fetchAsosProducts(query, limit, offset, log) {
+  if (!RAPIDAPI_KEY) {
+    log?.warn({ msg: 'RAPIDAPI_KEY not set — skipping ASOS' });
+    return [];
+  }
+
+  const params = new URLSearchParams({
+    searchTerm: query,
+    store:      'US',
+    lang:       'en-US',
+    currency:   'USD',
+    sizeSchema: 'US',
+    limit:      String(limit),
+    offset:     String(offset),
+  });
+  const url = `https://asos10.p.rapidapi.com/api/v1/getProductListBySearchTerm?${params.toString()}`;
+  log?.info({ msg: 'ASOS request', url, keyPrefix: RAPIDAPI_KEY.slice(0, 8) + '...' });
+
+  const res  = await fetch(url, {
+    method: 'GET',
+    headers: { 'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': 'asos10.p.rapidapi.com' },
+  });
+  const text = await res.text().catch(() => '');
+  log?.info({ msg: 'ASOS response', status: res.status, body: text.slice(0, 800) });
+
+  if (!res.ok) {
+    log?.error({ msg: 'ASOS error', status: res.status, body: text.slice(0, 300) });
+    throw new Error(`ASOS API ${res.status}`);
+  }
+
+  let data;
+  try { data = JSON.parse(text); }
+  catch { throw new Error('ASOS non-JSON response'); }
+
+  log?.info({ msg: 'ASOS data keys', keys: Object.keys(data ?? {}) });
+
+  // asos10 may return: { data: { products: [...] } } | { data: [...] } | { products: [...] } | [...]
+  let raw = [];
+  if (Array.isArray(data))                       raw = data;
+  else if (Array.isArray(data?.data?.products))  raw = data.data.products;
+  else if (Array.isArray(data?.data))            raw = data.data;
+  else if (Array.isArray(data?.products))        raw = data.products;
+
+  log?.info({ msg: 'ASOS raw count', count: raw.length });
+  if (raw.length > 0) log?.info({ msg: 'ASOS first product keys', keys: Object.keys(raw[0]) });
+
+  const resolvePrice = (item) => {
+    const v = item.price?.current?.value ?? item.price?.value ?? item.priceData?.current ?? item.currentPrice;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') return parseFloat(v.replace(/[^0-9.]/g, '')) || 0;
+    return 0;
+  };
+  const resolveUrl = (item) => {
+    const u = item.url ?? item.productUrl ?? item.link ?? '';
+    if (!u) return null;
+    if (u.startsWith('http')) return u;
+    if (u.startsWith('//'))   return `https:${u}`;
+    return `https://www.asos.com${u.startsWith('/') ? '' : '/'}${u}`;
+  };
+  const resolveImageUrl = (item) => {
+    const v = item.imageUrl ?? item.image ?? item.imageLink ?? null;
+    if (!v) return null;
+    if (v.startsWith('images.asos-media.com')) return `https://${v}`;
+    if (v.startsWith('//')) return `https:${v}`;
+    return v;
+  };
+
+  return raw.map(item => ({
+    id:         String(item.id ?? item.productId ?? Math.random()),
+    name:       item.name ?? item.productName ?? item.title ?? 'Unnamed product',
+    brand:      item.brandName ?? item.brand?.name ?? item.brand ?? 'ASOS',
+    price:      resolvePrice(item),
+    imageUrl:   resolveImageUrl(item),
+    productUrl: resolveUrl(item),
+    retailer:   'ASOS',
+  }));
+}
+
+async function fetchEbayProducts(query, limit, offset, log) {
+  if (!process.env.EBAY_CLIENT_ID || !process.env.EBAY_CERT_ID) {
+    log?.warn({ msg: 'EBAY_CLIENT_ID / EBAY_CERT_ID not set — skipping eBay' });
+    return [];
+  }
+
+  // Refresh token if missing or expiring within the next 5 minutes
+  console.log('[eBay] fetchEbayProducts — token present:', !!ebayAccessToken, '| expired:', Date.now() >= tokenExpiresAt);
+  if (!ebayAccessToken || Date.now() >= tokenExpiresAt) {
+    log?.info({ msg: 'Refreshing eBay access token' });
+    await refreshEbayToken();
+    log?.info({ msg: 'eBay token refreshed', expiresAt: new Date(tokenExpiresAt).toISOString() });
+  }
+
+  const params = new URLSearchParams({
+    q:            query,
+    limit:        String(limit),
+    offset:       String(offset),
+    category_ids: '11450', // eBay Clothing, Shoes & Accessories
+  });
+  const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?${params.toString()}`;
+  log?.info({ msg: 'eBay request', url });
+  console.log('[eBay] Browse API request:', url);
+
+  const res  = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization':           `Bearer ${ebayAccessToken}`,
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+      'Content-Type':            'application/json',
+    },
+  });
+  const text = await res.text().catch(() => '');
+  log?.info({ msg: 'eBay response', status: res.status, body: text.slice(0, 800) });
+  console.log('[eBay] Browse API response status:', res.status, '| body preview:', text.slice(0, 500));
+
+  if (!res.ok) {
+    log?.error({ msg: 'eBay error', status: res.status, body: text.slice(0, 300) });
+    throw new Error(`eBay API ${res.status}`);
+  }
+
+  let data;
+  try { data = JSON.parse(text); }
+  catch { throw new Error('eBay non-JSON response'); }
+
+  const raw = Array.isArray(data?.itemSummaries) ? data.itemSummaries : [];
+  log?.info({ msg: 'eBay raw count', count: raw.length });
+  console.log('[eBay] itemSummaries count:', raw.length, '| response top-level keys:', Object.keys(data ?? {}));
+  if (raw.length > 0) log?.info({ msg: 'eBay first item keys', keys: Object.keys(raw[0]) });
+  if (raw.length === 0) console.log('[eBay] WARNING: no itemSummaries — full response keys:', Object.keys(data ?? {}), '| body:', text.slice(0, 800));
+
+  return raw.map(item => ({
+    id:         String(item.itemId ?? Math.random()),
+    name:       item.title ?? 'Unnamed product',
+    brand:      item.brand ?? item.seller?.username ?? 'eBay Seller',
+    price:      parseFloat(item.price?.value ?? '0') || 0,
+    imageUrl:   item.image?.imageUrl ?? null,
+    productUrl: item.itemWebUrl ?? null,
+    retailer:   'eBay',
+  }));
+}
+
+// Fisher-Yates shuffle — blends eBay and ASOS results instead of grouping by source
+function shuffleArray(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ------- Retailers: ASOS + eBay blended feed -------
 app.get('/api/retailers', requireApiKey, async (req, res, next) => {
   try {
-    if (!RAPIDAPI_KEY) {
-      req.log.error({ msg: 'RAPIDAPI_KEY env var not set' });
-      return res.status(503).json({ error: { code: 'NO_RAPIDAPI_KEY', message: 'RAPIDAPI_KEY env var not set' } });
+    const query  = req.query.query ? String(req.query.query) : 'trending';
+    const limit  = Math.min(parseInt(String(req.query.limit  || '20'), 10) || 20, 48);
+    const offset = Math.max(parseInt(String(req.query.offset || '0'),  10) || 0,  0);
+
+    const [asosResult, ebayResult] = await Promise.allSettled([
+      fetchAsosProducts(query, limit, offset, req.log),
+      fetchEbayProducts(query, limit, offset, req.log),
+    ]);
+
+    if (asosResult.status === 'rejected') {
+      req.log.error({ msg: 'ASOS fetch failed', err: asosResult.reason?.message });
+    }
+    if (ebayResult.status === 'rejected') {
+      req.log.error({ msg: 'eBay fetch failed', err: ebayResult.reason?.message });
     }
 
-    const query = req.query.query ? String(req.query.query) : 'trending';
-    const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 48);
+    const asosProducts = asosResult.status  === 'fulfilled' ? asosResult.value : [];
+    const ebayProducts = ebayResult.status  === 'fulfilled' ? ebayResult.value : [];
 
-    const params = new URLSearchParams({
-      searchTerm: query,
-      store:      'US',
-      lang:       'en-US',
-      currency:   'USD',
-      sizeSchema: 'US',
-      limit:      String(limit),
+    // Deduplicate by product ID before shuffling (prevents the same item appearing twice
+    // when ASOS and eBay return overlapping results or on paginated re-fetches)
+    const seen    = new Set();
+    const deduped = [...asosProducts, ...ebayProducts].filter(p => {
+      if (seen.has(p.id)) return false;
+      seen.add(p.id);
+      return true;
     });
 
-    const asosUrl = `https://asos10.p.rapidapi.com/api/v1/getProductListBySearchTerm?${params.toString()}`;
+    const combined = shuffleArray(deduped);
 
     req.log.info({
-      msg:       'ASOS API request',
-      url:       asosUrl,
-      keyPrefix: RAPIDAPI_KEY.slice(0, 8) + '...',
+      msg:        'Retailer products combined',
+      asos:       asosProducts.length,
+      ebay:       ebayProducts.length,
+      duplicates: (asosProducts.length + ebayProducts.length) - deduped.length,
+      total:      combined.length,
     });
 
-    const asosRes = await fetch(asosUrl, {
-      method:  'GET',
-      headers: {
-        'x-rapidapi-key':  RAPIDAPI_KEY,
-        'x-rapidapi-host': 'asos10.p.rapidapi.com',
-      },
-    });
-
-    const asosBody = await asosRes.text().catch(() => '');
-
-    req.log.info({
-      msg:    'ASOS API response',
-      status: asosRes.status,
-      body:   asosBody.slice(0, 800),
-    });
-
-    if (!asosRes.ok) {
-      req.log.error({ msg: 'ASOS API error', status: asosRes.status, body: asosBody });
-      return res.status(502).json({
-        error: { code: 'ASOS_API_ERROR', message: `ASOS API ${asosRes.status}`, details: asosBody.slice(0, 300) },
-      });
-    }
-
-    let data;
-    try {
-      data = JSON.parse(asosBody);
-    } catch {
-      req.log.error({ msg: 'ASOS API non-JSON response', body: asosBody.slice(0, 300) });
-      return res.status(502).json({ error: { code: 'ASOS_PARSE_ERROR', message: 'Non-JSON response from ASOS API', details: asosBody.slice(0, 300) } });
-    }
-
-    // Log top-level keys so we can see the exact response shape in Render logs
-    req.log.info({ msg: 'ASOS API data keys', keys: Object.keys(data ?? {}) });
-
-    // asos10 may return: { data: { products: [...] } } | { data: [...] } | { products: [...] } | [...]
-    let raw = [];
-    if (Array.isArray(data))                         raw = data;
-    else if (Array.isArray(data?.data?.products))    raw = data.data.products;
-    else if (Array.isArray(data?.data))              raw = data.data;
-    else if (Array.isArray(data?.products))          raw = data.products;
-
-    req.log.info({ msg: 'ASOS raw product count', count: raw.length });
-    if (raw.length > 0) req.log.info({ msg: 'ASOS first product keys', keys: Object.keys(raw[0]) });
-
-    const resolvePrice = (item) => {
-      const v = item.price?.current?.value ?? item.price?.value ?? item.priceData?.current ?? item.currentPrice;
-      if (typeof v === 'number') return v;
-      if (typeof v === 'string') return parseFloat(v.replace(/[^0-9.]/g, '')) || 0;
-      return 0;
-    };
-
-    const resolveUrl = (item) => {
-      const raw = item.url ?? item.productUrl ?? item.link ?? '';
-      if (!raw) return null;
-      if (raw.startsWith('http')) return raw;
-      if (raw.startsWith('//'))   return `https:${raw}`;
-      return `https://www.asos.com${raw.startsWith('/') ? '' : '/'}${raw}`;
-    };
-
-    const resolveImageUrl = (item) => {
-      const v = item.imageUrl ?? item.image ?? item.imageLink ?? null;
-      if (!v) return null;
-      if (v.startsWith('images.asos-media.com')) return `https://${v}`;
-      if (v.startsWith('//')) return `https:${v}`;
-      return v;
-    };
-
-    const products = raw.map(item => ({
-      id:         String(item.id ?? item.productId ?? Math.random()),
-      name:       item.name ?? item.productName ?? item.title ?? 'Unnamed product',
-      brand:      item.brandName ?? item.brand?.name ?? item.brand ?? 'ASOS',
-      price:      resolvePrice(item),
-      imageUrl:   resolveImageUrl(item),
-      productUrl: resolveUrl(item),
-      retailer:   'ASOS',
-    }));
-
-    res.set('Cache-Control', 'public, max-age=300'); // 5 min — reduce RapidAPI quota usage
-    res.json(products);
+    res.set('Cache-Control', 'public, max-age=300'); // 5 min — reduce API quota usage
+    res.json(combined);
   } catch (err) { next(err); }
 });
 
