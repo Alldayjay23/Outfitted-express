@@ -675,16 +675,30 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     }
 
     const { occasion, weather, style, itemIds, topK } = parsed.data;
+    console.log('[suggest] itemIds received:', itemIds?.length ?? 0, itemIds);
+
     const items = await fetchClosetItemsByIds(itemIds);
+    console.log('[suggest] items fetched from Airtable:', items.length, items.map(i => ({
+      id: i.id,
+      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+    })));
     if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
     // Build AI-facing items with normalized categories; original item data is preserved for the response
     const itemsForAI = items.map(item => {
       const rawCat = readField(item.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '';
       const normalizedCat = normalizeCategory(rawCat);
+      console.log(`[suggest] normalizeCategory: "${rawCat}" → "${normalizedCat}" (id: ${item.id})`);
       if (normalizedCat === rawCat) return item;
       return { ...item, fields: { ...item.fields, [CLOSET_CATEGORY_FIELD]: normalizedCat } };
     });
+
+    console.log('[suggest] itemsForAI sent to AI:', itemsForAI.map(i => ({
+      id: i.id,
+      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+    })));
 
     const outfits = (String(SKIP_OPENAI).toLowerCase() === 'true')
       ? [{
