@@ -307,6 +307,7 @@ ${JSON.stringify(user, null, 2)}
       r.output_text ||
       (Array.isArray(r.output) ? r.output.flatMap(o => (o?.content || []).map(c => c?.text || '')).join('') : '') ||
       '';
+    console.log('[suggest] raw OpenAI response text (responses API):', text?.slice(0, 1000));
     const parsed = extractJson(text);
     if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
     if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
@@ -322,6 +323,7 @@ ${JSON.stringify(user, null, 2)}
         ]
       });
       const content = resp.choices?.[0]?.message?.content || '';
+      console.log('[suggest] raw OpenAI response text (chat API fallback):', content?.slice(0, 1000));
       const parsed  = extractJson(content);
       if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
       if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
@@ -710,11 +712,41 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
         }]
       : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK });
 
+    const closetCategoryMap = items.map(i => ({
+      id: i.id,
+      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+    }));
+
     const created = [];
     for (const o of outfits) {
+      console.log('[suggest] AI outfit.items:', o.items);
+      console.log('[suggest] closet item categories for matching:', closetCategoryMap.map(i => `${i.id} → "${i.category}"`));
+
+      // Match AI-returned item references against closet items using case-insensitive, trimmed comparison
+      // AI may return item IDs, item names, or category names
+      let selectedItems = items;
+      if (Array.isArray(o.items) && o.items.length > 0) {
+        const matched = items.filter(i => {
+          const id   = i.id;
+          const name = (readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '').toLowerCase().trim();
+          const cat  = (readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '').toLowerCase().trim();
+          return o.items.some(aiRef => {
+            const ref = String(aiRef).toLowerCase().trim();
+            const matched = ref === id || ref === name || ref === cat;
+            if (!matched && (ref === cat || cat.includes(ref) || ref.includes(cat))) {
+              console.log(`[suggest] category near-miss: AI "${aiRef}" vs closet "${readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category'])}"`);
+            }
+            return matched;
+          });
+        });
+        console.log('[suggest] matched items from AI selection:', matched.length, '/', items.length);
+        if (matched.length > 0) selectedItems = matched;
+      }
+
       const fields = {
         [OUTFITS_NAME_FIELD]: o.name,
-        [OUTFITS_ITEMS_FIELD]: items.map(i => i.id),
+        [OUTFITS_ITEMS_FIELD]: selectedItems.map(i => i.id),
         [OUTFITS_OCCASION_FIELD]: occasion,
         [OUTFITS_STYLE_FIELD]: style || '',
         [OUTFITS_WEATHER_FIELD]: weather || '',
