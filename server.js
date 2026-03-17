@@ -1114,6 +1114,14 @@ function shuffleArray(arr) {
   return a;
 }
 
+// ------- Skimlinks helper -------
+function wrapWithSkimlinks(url) {
+  const enabled = process.env.SKIMLINKS_ENABLED === 'true';
+  const publisherId = process.env.SKIMLINKS_PUBLISHER_ID;
+  if (!enabled || !publisherId) return url;
+  return `https://go.skimresources.com/?id=${publisherId}&url=${encodeURIComponent(url)}`;
+}
+
 // ------- Retailers: ASOS + eBay blended feed -------
 app.get('/api/retailers', requireApiKey, async (req, res, next) => {
   try {
@@ -1147,16 +1155,22 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
 
     const combined = shuffleArray(deduped);
 
+    // Wrap product URLs through Skimlinks if enabled
+    const products = combined.map(p => ({
+      ...p,
+      productUrl: wrapWithSkimlinks(p.productUrl),
+    }));
+
     req.log.info({
       msg:        'Retailer products combined',
       asos:       asosProducts.length,
       ebay:       ebayProducts.length,
       duplicates: (asosProducts.length + ebayProducts.length) - deduped.length,
-      total:      combined.length,
+      total:      products.length,
     });
 
     res.set('Cache-Control', 'public, max-age=300'); // 5 min — reduce API quota usage
-    res.json(combined);
+    res.json({ products, offset, hasMore: products.length === limit });
   } catch (err) { next(err); }
 });
 
