@@ -265,22 +265,22 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
   }
 
   const system = `You are a fashion stylist AI. Return ONLY valid JSON:
-{"outfits":[{"name":"string","items":["string"],"reasoning":"string","palette":["string"],"preview":""}]}`;
+{"outfits":[{"name":"string","items":["category"],"reasoning":"string","palette":["string"],"preview":""}]}
+
+IMPORTANT: Each value in the "items" array must be a clothing category name copied exactly from the "category" field of the provided closet items (e.g. "Tops", "Shoes", "Dresses"). Do NOT use item names, brands, IDs, or any other value — only the "category" field values. One category per outfit slot.`;
 
   const user = {
     occasion, weather: weather || '', style: style || '',
     items: items.map(i => ({
-      id: i.id,
-      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || 'Unknown',
       category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
       color: readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
       brand: readField(i.fields, CLOSET_BRAND_FIELD, ['Brand']) || '',
-      photo: readPhotoFromFields(i.fields)
     })),
     count: topK
   };
 
   const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
+In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields (e.g. "Tops", "Shoes"). One category per slot — do not use item names or IDs.
 Return ONLY JSON. No prose.
 
 Input:
@@ -712,36 +712,40 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
         }]
       : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK });
 
-    const closetCategoryMap = items.map(i => ({
-      id: i.id,
-      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-    }));
+    // Map each closet item to the category the AI actually saw (post-normalization)
+    const aiCategoryById = new Map(
+      itemsForAI.map(i => [
+        i.id,
+        (readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '').toLowerCase().trim()
+      ])
+    );
+    console.log('[suggest] AI-visible categories:', [...aiCategoryById.entries()].map(([id, cat]) => `${id} → "${cat}"`));
 
     const created = [];
     for (const o of outfits) {
       console.log('[suggest] AI outfit.items:', o.items);
-      console.log('[suggest] closet item categories for matching:', closetCategoryMap.map(i => `${i.id} → "${i.category}"`));
 
-      // Match AI-returned item references against closet items using case-insensitive, trimmed comparison
-      // AI may return item IDs, item names, or category names
-      let selectedItems = items;
+      // For each AI-returned category, pick the first closet item whose (normalized) category
+      // matches case-insensitively. Skip unmatched categories; deduplicate by item ID.
+      let selectedItems;
       if (Array.isArray(o.items) && o.items.length > 0) {
-        const matched = items.filter(i => {
-          const id   = i.id;
-          const name = (readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '').toLowerCase().trim();
-          const cat  = (readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '').toLowerCase().trim();
-          return o.items.some(aiRef => {
-            const ref = String(aiRef).toLowerCase().trim();
-            const matched = ref === id || ref === name || ref === cat;
-            if (!matched && (ref === cat || cat.includes(ref) || ref.includes(cat))) {
-              console.log(`[suggest] category near-miss: AI "${aiRef}" vs closet "${readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category'])}"`);
-            }
-            return matched;
-          });
-        });
-        console.log('[suggest] matched items from AI selection:', matched.length, '/', items.length);
-        if (matched.length > 0) selectedItems = matched;
+        const usedIds = new Set();
+        const matched = [];
+        for (const aiCat of o.items) {
+          const ref = String(aiCat).toLowerCase().trim();
+          const pick = items.find(i => !usedIds.has(i.id) && aiCategoryById.get(i.id) === ref);
+          if (pick) {
+            console.log(`[suggest] matched AI category "${aiCat}" → item ${pick.id}`);
+            matched.push(pick);
+            usedIds.add(pick.id);
+          } else {
+            console.log(`[suggest] no closet item found for AI category "${aiCat}" — skipping`);
+          }
+        }
+        console.log('[suggest] final matched items:', matched.length, '/', items.length);
+        selectedItems = matched.length > 0 ? matched : items;
+      } else {
+        selectedItems = items;
       }
 
       const fields = {
