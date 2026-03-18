@@ -62,7 +62,10 @@ const {
   CLOUDINARY_CLOUD_NAME,
   CLOUDINARY_API_KEY,
   CLOUDINARY_API_SECRET,
-  CLOUDINARY_FOLDER = 'outfitted'
+  CLOUDINARY_FOLDER = 'outfitted',
+
+  // Virtual Try-On — add FASHN_API_KEY to Render environment variables
+  FASHN_API_KEY
 } = process.env;
 
 // --- eBay OAuth token state (auto-refreshed, never hardcoded) ---
@@ -1210,6 +1213,91 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
 
     res.set('Cache-Control', 'public, max-age=300'); // 5 min — reduce API quota usage
     res.json({ products, offset, hasMore: products.length === limit });
+  } catch (err) { next(err); }
+});
+
+// ------- Virtual Try-On (Fashn.ai) -------
+app.post('/api/vto', requireApiKey, async (req, res, next) => {
+  try {
+    const { modelImageUrl, garmentImageUrl, category } = req.body;
+
+    if (!modelImageUrl || !garmentImageUrl || !category) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'modelImageUrl, garmentImageUrl, and category are required' } });
+    }
+
+    if (!FASHN_API_KEY) {
+      return res.status(500).json({ error: { code: 'NO_FASHN_KEY', message: 'FASHN_API_KEY not configured — add it to Render environment variables' } });
+    }
+
+    // Map closet category string → Fashn.ai category
+    const cat = String(category).toLowerCase().trim();
+    let fashnCategory;
+    const TOPS_KW       = ['tee', 'shirt', 'top', 'sweater', 'jacket', 'outerwear', 'blouse', 'vest', 'polo', 'tank', 'hoodie', 'sweatshirt', 'knit', 'cardigan', 'coat', 'blazer'];
+    const BOTTOMS_KW    = ['pants', 'pant', 'jeans', 'jean', 'shorts', 'short', 'skirt', 'bottom', 'bottoms', 'trouser', 'legging'];
+    const ONE_PIECE_KW  = ['dress', 'jumpsuit', 'romper', 'gown'];
+    const UNSUPPORTED_KW = ['shoes', 'shoe', 'boot', 'boots', 'heel', 'heels', 'sneaker', 'sneakers', 'sandal', 'sandals', 'loafer', 'flat', 'mule', 'hat', 'hats', 'cap', 'accessory', 'accessories', 'belt', 'scarf', 'jewelry', 'watch', 'sunglasses', 'purse', 'handbag', 'bag'];
+
+    if (UNSUPPORTED_KW.some(k => cat.includes(k))) {
+      return res.status(400).json({ error: { code: 'VTO_UNSUPPORTED', message: 'VTO not supported for this category' } });
+    } else if (ONE_PIECE_KW.some(k => cat.includes(k))) {
+      fashnCategory = 'one-pieces';
+    } else if (BOTTOMS_KW.some(k => cat.includes(k))) {
+      fashnCategory = 'bottoms';
+    } else if (TOPS_KW.some(k => cat.includes(k))) {
+      fashnCategory = 'tops';
+    } else {
+      fashnCategory = 'tops'; // default for unknown categories
+    }
+
+    req.log.info({ msg: 'VTO submit', fashnCategory, category });
+
+    // Submit job to Fashn.ai
+    const submitRes = await fetch('https://api.fashn.ai/v1/run', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${FASHN_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_name: 'tryon-v1.6', model_image: modelImageUrl, garment_image: garmentImageUrl, category: fashnCategory }),
+    });
+    const submitText = await submitRes.text();
+    if (!submitRes.ok) {
+      req.log.error({ msg: 'Fashn.ai submit failed', status: submitRes.status, body: submitText.slice(0, 300) });
+      return res.status(502).json({ error: { code: 'FASHN_SUBMIT_ERROR', message: `Fashn.ai submit failed: ${submitText.slice(0, 200)}` } });
+    }
+    let submitData;
+    try { submitData = JSON.parse(submitText); } catch { return res.status(502).json({ error: { code: 'FASHN_BAD_RESPONSE', message: 'Fashn.ai returned non-JSON on submit' } }); }
+
+    const jobId = submitData.id;
+    if (!jobId) return res.status(502).json({ error: { code: 'FASHN_NO_ID', message: 'Fashn.ai did not return a job ID' } });
+
+    req.log.info({ msg: 'VTO job submitted', jobId, fashnCategory });
+
+    // Poll for result (2s interval, max 30 attempts = 60s)
+    const MAX_ATTEMPTS = 30;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const pollRes  = await fetch(`https://api.fashn.ai/v1/status/${jobId}`, {
+        headers: { 'Authorization': `Bearer ${FASHN_API_KEY}` },
+      });
+      const pollText = await pollRes.text();
+      if (!pollRes.ok) { req.log.warn({ msg: 'VTO poll error', attempt, status: pollRes.status }); continue; }
+
+      let pollData;
+      try { pollData = JSON.parse(pollText); } catch { continue; }
+
+      req.log.info({ msg: 'VTO poll', attempt, status: pollData.status });
+
+      if (pollData.status === 'completed') {
+        const resultUrl = Array.isArray(pollData.output) ? pollData.output[0] : pollData.output;
+        if (!resultUrl) return res.status(502).json({ error: { code: 'FASHN_NO_OUTPUT', message: 'Fashn.ai completed but returned no output URL' } });
+        return res.json({ resultUrl });
+      }
+      if (pollData.status === 'failed') {
+        const errMsg = pollData.error || pollData.message || 'Unknown Fashn.ai error';
+        return res.status(400).json({ error: { code: 'FASHN_FAILED', message: errMsg } });
+      }
+    }
+
+    return res.status(408).json({ error: { code: 'VTO_TIMEOUT', message: 'Virtual Try-On timed out after 60 seconds' } });
   } catch (err) { next(err); }
 });
 
