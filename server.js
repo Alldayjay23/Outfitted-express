@@ -1255,7 +1255,7 @@ app.post('/api/vto', requireApiKey, async (req, res, next) => {
     const submitRes = await fetch('https://api.fashn.ai/v1/run', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${FASHN_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model_name: 'tryon-v1.6', model_image: modelImageUrl, garment_image: garmentImageUrl, category: fashnCategory }),
+      body: JSON.stringify({ model_name: 'tryon-v1.6', inputs: { model_image: modelImageUrl, garment_image: garmentImageUrl, category: fashnCategory } }),
     });
     const submitText = await submitRes.text();
     if (!submitRes.ok) {
