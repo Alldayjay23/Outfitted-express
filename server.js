@@ -283,6 +283,8 @@ IMPORTANT: Each value in the "items" array must be a clothing category name copi
 In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields (e.g. "Tops", "Shoes"). One category per slot — do not use item names or IDs.
 Return ONLY JSON. No prose.
 
+Session: ${Date.now()}
+
 Input:
 ${JSON.stringify(user, null, 2)}
 `;
@@ -298,6 +300,7 @@ ${JSON.stringify(user, null, 2)}
   try {
     const r = await openai.responses.create({
       model: OPENAI_MODEL,
+      temperature: 0.9,
       input: [
         { role: 'system', content: system },
         { role: 'user',  content: prompt }
@@ -316,7 +319,7 @@ ${JSON.stringify(user, null, 2)}
     try {
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
-        temperature: 0.2,
+        temperature: 0.9,
         messages: [
           { role: 'system', content: system },
           { role: 'user',   content: prompt }
