@@ -270,7 +270,9 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
   const system = `You are a fashion stylist AI. Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["category"],"reasoning":"string","palette":["string"],"preview":""}]}
 
-IMPORTANT: Each value in the "items" array must be a clothing category name copied exactly from the "category" field of the provided closet items (e.g. "Tops", "Shoes", "Dresses"). Do NOT use item names, brands, IDs, or any other value — only the "category" field values. One category per outfit slot.`;
+IMPORTANT: Each value in the "items" array must be a clothing category name copied exactly from the "category" field of the provided closet items (e.g. "Tops", "Shoes", "Dresses"). Do NOT use item names, brands, IDs, or any other value — only the "category" field values. One category per outfit slot.
+
+Vary your suggestions every time — choose different combinations, color palettes, layering approaches, and outfit moods. Avoid repeating the same look.`;
 
   const user = {
     occasion, weather: weather || '', style: style || '',
@@ -286,7 +288,7 @@ IMPORTANT: Each value in the "items" array must be a clothing category name copi
 In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields (e.g. "Tops", "Shoes"). One category per slot — do not use item names or IDs.
 Return ONLY JSON. No prose.
 
-Session: ${Date.now()}
+Seed: ${Date.now()}-${Math.random().toString(36).slice(2)}
 
 Input:
 ${JSON.stringify(user, null, 2)}
@@ -303,7 +305,7 @@ ${JSON.stringify(user, null, 2)}
   try {
     const r = await openai.responses.create({
       model: OPENAI_MODEL,
-      temperature: 0.9,
+      temperature: 1.0,
       input: [
         { role: 'system', content: system },
         { role: 'user',  content: prompt }
@@ -322,7 +324,7 @@ ${JSON.stringify(user, null, 2)}
     try {
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
-        temperature: 0.9,
+        temperature: 1.0,
         messages: [
           { role: 'system', content: system },
           { role: 'user',   content: prompt }
@@ -1167,9 +1169,39 @@ function wrapWithSkimlinks(url) {
 // ------- Retailers: ASOS + eBay blended feed -------
 app.get('/api/retailers', requireApiKey, async (req, res, next) => {
   try {
-    const query  = req.query.query ? String(req.query.query) : 'trending';
-    const limit  = Math.min(parseInt(String(req.query.limit  || '20'), 10) || 20, 48);
+    let query  = req.query.query ? String(req.query.query) : 'trending';
+    const limit  = Math.min(parseInt(String(req.query.limit  || '24'), 10) || 24, 48);
     const offset = Math.max(parseInt(String(req.query.offset || '0'),  10) || 0,  0);
+
+    // Gender detection: prefix query with "women" or "men" based on closet items
+    // Only runs when query doesn't already have a gender keyword and userId is present
+    const uid = req.header('x-user-id');
+    const hasGender = /\b(women|woman|female|men|man|male|unisex)\b/i.test(query);
+    if (uid && !hasGender) {
+      try {
+        const WOMEN_KW = ['women', 'woman', 'female', 'ladies', 'girl', 'dress', 'skirt', 'blouse', 'heels', 'bra'];
+        const MEN_KW   = ['men', 'man', 'male', 'guys', 'gents', 'suit', 'tie', 'boxer', 'briefs'];
+        const records  = await tbCloset.select({
+          filterByFormula: `{${CLOSET_USER_FIELD}}='${esc(uid)}'`,
+          maxRecords: 30,
+          pageSize:   30,
+        }).firstPage();
+        let womenScore = 0, menScore = 0;
+        for (const r of records) {
+          const name = String(readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '').toLowerCase();
+          const cat  = String(readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '').toLowerCase();
+          const combined = `${name} ${cat}`;
+          if (WOMEN_KW.some((k) => combined.includes(k))) womenScore++;
+          if (MEN_KW.some((k) => combined.includes(k))) menScore++;
+        }
+        const total = records.length || 1;
+        if (womenScore / total >= 0.4 && womenScore >= menScore) query = `women ${query}`;
+        else if (menScore / total >= 0.4 && menScore > womenScore) query = `men ${query}`;
+      } catch (e) {
+        req.log?.warn?.({ msg: 'gender detection failed', err: e?.message });
+        // fallback: use original query unchanged
+      }
+    }
 
     const [asosResult, ebayResult] = await Promise.allSettled([
       fetchAsosProducts(query, limit, offset, req.log),
@@ -1212,7 +1244,7 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
     });
 
     res.set('Cache-Control', 'public, max-age=300'); // 5 min — reduce API quota usage
-    res.json({ products, offset, hasMore: products.length === limit });
+    res.json({ products, offset, hasMore: products.length > 0 && offset + products.length < 200 });
   } catch (err) { next(err); }
 });
 
