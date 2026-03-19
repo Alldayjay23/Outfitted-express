@@ -284,11 +284,14 @@ Vary your suggestions every time — choose different combinations, color palett
     count: topK
   };
 
+  const seed = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  console.log('[suggest] seed:', seed);
+
   const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
 In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields (e.g. "Tops", "Shoes"). One category per slot — do not use item names or IDs.
 Return ONLY JSON. No prose.
 
-Seed: ${Date.now()}-${Math.random().toString(36).slice(2)}
+Seed: ${seed}
 
 Input:
 ${JSON.stringify(user, null, 2)}
@@ -1173,11 +1176,19 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
     const limit  = Math.min(parseInt(String(req.query.limit  || '24'), 10) || 24, 48);
     const offset = Math.max(parseInt(String(req.query.offset || '0'),  10) || 0,  0);
 
-    // Gender detection: prefix query with "women" or "men" based on closet items
-    // Only runs when query doesn't already have a gender keyword and userId is present
+    // Gender prefix: explicit ?filter param takes priority; fall back to closet analysis
     const uid = req.header('x-user-id');
     const hasGender = /\b(women|woman|female|men|man|male|unisex)\b/i.test(query);
-    if (uid && !hasGender) {
+    const genderFilter = String(req.query.filter || '').toLowerCase().trim();
+
+    if (genderFilter === 'women' || genderFilter === 'woman') {
+      if (!hasGender) query = `women ${query}`;
+      console.log('[retailers] gender prefix: filter param =>', query);
+    } else if (genderFilter === 'men' || genderFilter === 'man') {
+      if (!hasGender) query = `men ${query}`;
+      console.log('[retailers] gender prefix: filter param =>', query);
+    } else if (uid && !hasGender) {
+      // Closet-based gender detection
       try {
         const WOMEN_KW = ['women', 'woman', 'female', 'ladies', 'girl', 'dress', 'skirt', 'blouse', 'heels', 'bra'];
         const MEN_KW   = ['men', 'man', 'male', 'guys', 'gents', 'suit', 'tie', 'boxer', 'briefs'];
@@ -1186,6 +1197,13 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
           maxRecords: 30,
           pageSize:   30,
         }).firstPage();
+
+        // Log raw field names from first 3 records for debugging
+        if (records.length > 0) {
+          const sample = records.slice(0, 3).map(r => ({ id: r.id, fields: Object.keys(r.fields) }));
+          console.log('[retailers] closet sample field names:', JSON.stringify(sample));
+        }
+
         let womenScore = 0, menScore = 0;
         for (const r of records) {
           const name = String(readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '').toLowerCase();
@@ -1195,12 +1213,21 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
           if (MEN_KW.some((k) => combined.includes(k))) menScore++;
         }
         const total = records.length || 1;
-        if (womenScore / total >= 0.4 && womenScore >= menScore) query = `women ${query}`;
-        else if (menScore / total >= 0.4 && menScore > womenScore) query = `men ${query}`;
+        let genderApplied = 'none';
+        if (womenScore / total >= 0.4 && womenScore >= menScore) {
+          query = `women ${query}`;
+          genderApplied = 'women';
+        } else if (menScore / total >= 0.4 && menScore > womenScore) {
+          query = `men ${query}`;
+          genderApplied = 'men';
+        }
+        console.log(`[retailers] gender detection: ${records.length} items, womenScore=${womenScore}, menScore=${menScore}, applied=${genderApplied}, query="${query}"`);
       } catch (e) {
-        req.log?.warn?.({ msg: 'gender detection failed', err: e?.message });
+        console.warn('[retailers] gender detection failed:', e?.message);
         // fallback: use original query unchanged
       }
+    } else {
+      console.log('[retailers] gender prefix: skipped (hasGender=' + hasGender + ', noFilter), final query:', query);
     }
 
     const [asosResult, ebayResult] = await Promise.allSettled([
