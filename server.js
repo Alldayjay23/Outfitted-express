@@ -325,6 +325,7 @@ ${JSON.stringify(user, null, 2)}
     return parsed.outfits;
   } catch (e1) {
     try {
+      console.log('[suggest] seed (chat fallback):', seed);
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
         temperature: 1.0,
@@ -1198,11 +1199,12 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
           pageSize:   30,
         }).firstPage();
 
-        // Log raw field names from first 3 records for debugging
-        if (records.length > 0) {
-          const sample = records.slice(0, 3).map(r => ({ id: r.id, fields: Object.keys(r.fields) }));
-          console.log('[retailers] closet sample field names:', JSON.stringify(sample));
-        }
+        // Log raw items being used for gender detection
+        console.log('[retailers] closet items for gender detection:', records.map(r => ({
+          id: r.id,
+          name: readField(r.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
+          category: readField(r.fields, CLOSET_CATEGORY_FIELD, ['Category']),
+        })));
 
         let womenScore = 0, menScore = 0;
         for (const r of records) {
@@ -1220,8 +1222,12 @@ app.get('/api/retailers', requireApiKey, async (req, res, next) => {
         } else if (menScore / total >= 0.4 && menScore > womenScore) {
           query = `men ${query}`;
           genderApplied = 'men';
+        } else {
+          // No clear gender signal — default to men
+          query = `men ${query}`;
+          genderApplied = 'men (fallback)';
         }
-        console.log(`[retailers] gender detection: ${records.length} items, womenScore=${womenScore}, menScore=${menScore}, applied=${genderApplied}, query="${query}"`);
+        console.log(`[retailers] gender detection: ${records.length} items, womenScore=${womenScore}, menScore=${menScore}, applied=${genderApplied}, final query="${query}"`);
       } catch (e) {
         console.warn('[retailers] gender detection failed:', e?.message);
         // fallback: use original query unchanged
