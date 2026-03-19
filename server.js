@@ -267,12 +267,15 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
     }];
   }
 
-  const system = `You are a fashion stylist AI. Return ONLY valid JSON:
+  const system = `You are a creative fashion stylist. Every single request MUST produce a completely unique outfit with a different name, different item categories, and different styling angle than any typical suggestion. Rotate through different outfit archetypes: casual, streetwear, business casual, athletic, evening, resort, layered, minimalist. Never suggest the same archetype twice in a row.
+
+Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["category"],"reasoning":"string","palette":["string"],"preview":""}]}
 
-IMPORTANT: Each value in the "items" array must be a clothing category name copied exactly from the "category" field of the provided closet items (e.g. "Tops", "Shoes", "Dresses"). Do NOT use item names, brands, IDs, or any other value — only the "category" field values. One category per outfit slot.
-
-Vary your suggestions every time — choose different combinations, color palettes, layering approaches, and outfit moods. Avoid repeating the same look.`;
+IMPORTANT:
+- Each value in the "items" array must be a clothing category name copied exactly from the "category" field of the provided closet items. Do NOT use item names, brands, IDs, or any other value — only the "category" field values. One category per outfit slot.
+- Limit each outfit to a maximum of 3 items: 1 top + 1 bottom + at most 1 optional layer/outerwear. Do NOT include shoes, hats, accessories, or bags.
+- Pick a fresh, unexpected styling direction every time.`;
 
   const user = {
     occasion, weather: weather || '', style: style || '',
@@ -288,7 +291,9 @@ Vary your suggestions every time — choose different combinations, color palett
   console.log('[suggest] seed:', seed);
 
   const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
-In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields (e.g. "Tops", "Shoes"). One category per slot — do not use item names or IDs.
+In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields. One category per slot — do not use item names or IDs.
+Max 3 items per outfit: 1 top + 1 bottom + at most 1 layer. No shoes, hats, or accessories.
+Important: Do NOT suggest "Chic Date Night" or any outfit you have suggested before. Pick a completely different styling direction.
 Return ONLY JSON. No prose.
 
 Seed: ${seed}
@@ -755,7 +760,9 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
           }
         }
         console.log('[suggest] final matched items:', matched.length, '/', items.length);
-        selectedItems = matched.length > 0 ? matched : items;
+        // Cap at 3 items: top + bottom + optional layer
+        const capped = matched.slice(0, 3);
+        selectedItems = capped.length > 0 ? capped : items.slice(0, 3);
       } else {
         selectedItems = items;
       }
