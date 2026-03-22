@@ -267,7 +267,7 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
     }];
   }
 
-  const system = `You are a creative fashion stylist. Every single request MUST produce a completely unique outfit with a different name, different item categories, and different styling angle than any typical suggestion. Rotate through different outfit archetypes: casual, streetwear, business casual, athletic, evening, resort, layered, minimalist. Never suggest the same archetype twice in a row.
+  const system = `You are a creative fashion stylist. Each outfit you suggest MUST be completely different from any previous suggestion. You are forbidden from suggesting the same outfit name, the same combination of categories, or the same styling direction twice. Rotate through these archetypes in order, never repeating: casual-streetwear, business-casual, athletic-inspired, evening-out, resort-vacation, layered-transitional, minimalist-clean, bold-statement. Pick the next archetype in the rotation based on the current seed value.
 
 Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["category"],"reasoning":"string","palette":["string"],"preview":""}]}
@@ -287,16 +287,17 @@ IMPORTANT:
     count: topK
   };
 
-  const seed = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const seed = `${Date.now()}-${Math.random()}`;
   console.log('[suggest] seed:', seed);
+  console.log('[suggest] archetype seed:', seed);
 
   const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
 In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields. One category per slot — do not use item names or IDs.
 Max 3 items per outfit: 1 top + 1 bottom + at most 1 layer. No shoes, hats, or accessories.
-Important: Do NOT suggest "Chic Date Night" or any outfit you have suggested before. Pick a completely different styling direction.
+Important: Pick the next archetype in the rotation based on the seed value. NEVER repeat an archetype or styling direction.
 Return ONLY JSON. No prose.
 
-Seed: ${seed}
+Seed: ${Date.now()}-${Math.random()}
 
 Input:
 ${JSON.stringify(user, null, 2)}
@@ -311,6 +312,7 @@ ${JSON.stringify(user, null, 2)}
   };
 
   try {
+    console.log('[suggest] using path:', 'responses');
     const r = await openai.responses.create({
       model: OPENAI_MODEL,
       temperature: 1.0,
@@ -330,6 +332,7 @@ ${JSON.stringify(user, null, 2)}
     return parsed.outfits;
   } catch (e1) {
     try {
+      console.log('[suggest] using path:', 'chat');
       console.log('[suggest] seed (chat fallback):', seed);
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
@@ -1017,11 +1020,26 @@ app.patch('/api/orders/:id', requireApiKey, async (req, res, next) => {
 
 // ------- Retailer source helpers -------
 
+// In-memory ASOS cache — reduces API quota usage
+const asosCache = new Map(); // key → { data, timestamp }
+const ASOS_CACHE_TTL_PAGINATED = 30 * 60 * 1000;  // 30 min for offset > 0
+const ASOS_CACHE_TTL_INITIAL   =  2 * 60 * 60 * 1000; // 2 hours for offset 0
+const ASOS_CACHE_MAX_SIZE = 100;
+
 async function fetchAsosProducts(query, limit, offset, log) {
   if (!RAPIDAPI_KEY) {
     log?.warn({ msg: 'RAPIDAPI_KEY not set — skipping ASOS' });
     return [];
   }
+
+  const cacheKey = `${query}|${limit}|${offset}`;
+  const ttl = offset === 0 ? ASOS_CACHE_TTL_INITIAL : ASOS_CACHE_TTL_PAGINATED;
+  const cached = asosCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < ttl) {
+    console.log('[retailers] cache HIT:', cacheKey);
+    return cached.data;
+  }
+  console.log('[retailers] cache MISS:', cacheKey);
 
   const params = new URLSearchParams({
     searchTerm: query,
@@ -1084,7 +1102,7 @@ async function fetchAsosProducts(query, limit, offset, log) {
     return v;
   };
 
-  return raw.map(item => ({
+  const result = raw.map(item => ({
     id:         String(item.id ?? item.productId ?? Math.random()),
     name:       item.name ?? item.productName ?? item.title ?? 'Unnamed product',
     brand:      item.brandName ?? item.brand?.name ?? item.brand ?? 'ASOS',
@@ -1093,6 +1111,14 @@ async function fetchAsosProducts(query, limit, offset, log) {
     productUrl: resolveUrl(item),
     retailer:   'ASOS',
   }));
+
+  // Evict oldest entry if at capacity before storing
+  if (asosCache.size >= ASOS_CACHE_MAX_SIZE) {
+    asosCache.delete(asosCache.keys().next().value);
+  }
+  asosCache.set(cacheKey, { data: result, timestamp: Date.now() });
+
+  return result;
 }
 
 async function fetchEbayProducts(query, limit, offset, log) {
