@@ -546,10 +546,10 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
       try {
         const styleData = await generateStyleData({ name, category: category || '', color: color || '' });
         if (styleData) {
+          // Style Tags is an Airtable AI field that accepts plain string writes
           await tbCloset.update(r.id, {
-            'Style Tags':       String(styleData.style_tags || '').trim(),
-            'Suggested Outfits': String(styleData.suggested_outfits || '').trim(),
-          });
+            'Style Tags': String(styleData.style_tags || '').trim(),
+          }, { typecast: true });
           console.log(`[closet] style data saved for new item: ${r.id} "${name}"`);
         }
       } catch (e) {
