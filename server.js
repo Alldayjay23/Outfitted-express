@@ -281,9 +281,19 @@ IMPORTANT:
   const aiFieldValue = (raw) => {
     if (!raw) return '';
     if (typeof raw === 'string') return raw;
-    if (typeof raw === 'object' && 'value' in raw) return raw.value || '';
+    if (Array.isArray(raw)) return raw.join(', ');
+    if (typeof raw === 'object' && 'value' in raw) {
+      const v = raw.value;
+      if (!v) return '';
+      if (Array.isArray(v)) return v.join(', ');
+      return String(v);
+    }
     return '';
   };
+
+  console.log('[suggest] raw first item fields:', JSON.stringify(
+    items[0]?.fields || items[0], null, 2
+  ));
 
   const aiItems = items.map(i => ({
     id:              i.id,
@@ -722,6 +732,24 @@ app.delete('/api/listings/:id', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Fuzzy category aliases for AI-returned category matching
+const CATEGORY_MATCH_ALIASES = {
+  pants:    ['bottom', 'pants', 'jeans'],
+  trousers: ['bottom', 'pants', 'jeans'],
+  chinos:   ['bottom', 'pants', 'jeans'],
+  jeans:    ['bottom', 'pants', 'jeans'],
+  bottom:   ['bottom', 'pants', 'jeans', 'shorts', 'skirt'],
+  top:      ['top', 'tee', 'shirt'],
+  shirt:    ['top', 'tee', 'shirt'],
+  tee:      ['top', 'tee', 'shirt'],
+  blouse:   ['top', 'tee', 'shirt'],
+  jacket:   ['outerwear', 'jacket'],
+  coat:     ['outerwear', 'jacket'],
+  blazer:   ['outerwear', 'jacket'],
+  dress:    ['one-piece', 'dress'],
+  jumpsuit: ['one-piece', 'dress'],
+};
+
 // Category normalization for outfit suggestion
 const CATEGORY_NORMALIZATION_MAP = {
   tee: 'top', shirt: 'top', blouse: 'top', sweater: 'top', hoodie: 'top', tank: 'top', 'long sleeve': 'top',
@@ -813,17 +841,19 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
 
     const created = [];
     for (const o of outfits) {
-      console.log('[suggest] AI outfit.items:', o.items);
+      console.log('[suggest] AI returned items:', JSON.stringify(o.items));
+      console.log('[suggest] available categories:', [...aiCategoryById.values()].join(', '));
 
       // For each AI-returned category, pick the first closet item whose (normalized) category
-      // matches case-insensitively. Skip unmatched categories; deduplicate by item ID.
+      // matches case-insensitively (with fuzzy aliases). Skip unmatched; deduplicate by item ID.
       let selectedItems;
       if (Array.isArray(o.items) && o.items.length > 0) {
         const usedIds = new Set();
         const matched = [];
         for (const aiCat of o.items) {
           const ref = String(aiCat).toLowerCase().trim();
-          const pick = items.find(i => !usedIds.has(i.id) && aiCategoryById.get(i.id) === ref);
+          const aliases = CATEGORY_MATCH_ALIASES[ref] || [ref];
+          const pick = items.find(i => !usedIds.has(i.id) && aliases.includes(aiCategoryById.get(i.id)));
           if (pick) {
             console.log(`[suggest] matched AI category "${aiCat}" → item ${pick.id}`);
             matched.push(pick);
