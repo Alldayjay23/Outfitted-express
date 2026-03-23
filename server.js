@@ -256,7 +256,7 @@ const DescribeSchema = z.object({
 });
 
 // ---------- OPENAI ----------
-async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) {
+async function generateOutfitsWithAI({ items, occasion, weather, style, topK, conversationMessages }) {
   if (String(SKIP_OPENAI).toLowerCase() === 'true') {
     return [{
       name: `${style || 'Look'} for ${occasion}`,
@@ -322,15 +322,17 @@ Seed: ${seed}
     try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
   };
 
+  // Build messages array: if conversationHistory provided, use it; else single-turn
+  const messages = conversationMessages && conversationMessages.length > 0
+    ? [{ role: 'system', content: system }, ...conversationMessages]
+    : [{ role: 'system', content: system }, { role: 'user', content: prompt }];
+
   try {
     console.log('[suggest] using path:', 'responses');
     const r = await openai.responses.create({
       model: OPENAI_MODEL,
       temperature: 1.0,
-      input: [
-        { role: 'system', content: system },
-        { role: 'user',  content: prompt }
-      ]
+      input: messages
     });
     const text =
       r.output_text ||
@@ -348,10 +350,7 @@ Seed: ${seed}
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
         temperature: 1.0,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user',   content: prompt }
-        ]
+        messages
       });
       const content = resp.choices?.[0]?.message?.content || '';
       console.log('[suggest] raw OpenAI response text (chat API fallback):', content?.slice(0, 1000));
@@ -737,6 +736,24 @@ function normalizeCategory(raw) {
   return CATEGORY_NORMALIZATION_MAP[lower] ?? raw;
 }
 
+// ------- Transcribe voice (Whisper) -------
+app.post('/api/outfits/transcribe', requireApiKey, async (req, res, next) => {
+  try {
+    const { audio, mimeType } = req.body;
+    if (!audio || typeof audio !== 'string') {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'audio (base64) is required' } });
+    }
+    const buffer = Buffer.from(audio, 'base64');
+    const { toFile } = require('openai');
+    const file = await toFile(buffer, 'audio.m4a', { type: mimeType || 'audio/m4a' });
+    const transcription = await openai.audio.transcriptions.create({
+      model: 'whisper-1',
+      file,
+    });
+    res.json({ text: transcription.text });
+  } catch (err) { next(err); }
+});
+
 // ------- Suggest outfits (stub if SKIP_OPENAI=true) -------
 app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   req.log.info('USING_STUB_SUGGEST');
@@ -747,7 +764,10 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     }
 
     const { occasion, weather, style, itemIds, topK } = parsed.data;
+    // Optional conversation history from multi-turn refinement loop
+    const conversationMessages = Array.isArray(req.body.messages) ? req.body.messages : null;
     console.log('[suggest] itemIds received:', itemIds?.length ?? 0, itemIds);
+    if (conversationMessages) console.log('[suggest] conversationMessages received:', conversationMessages.length);
 
     const items = await fetchClosetItemsByIds(itemIds);
     console.log('[suggest] items fetched from Airtable:', items.length, items.map(i => ({
@@ -780,7 +800,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
           palette: Array.from(new Set(items.map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim()).filter(Boolean))).slice(0,5),
           preview: ''
         }]
-      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK });
+      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK, conversationMessages });
 
     // Map each closet item to the category the AI actually saw (post-normalization)
     const aiCategoryById = new Map(
