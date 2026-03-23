@@ -356,6 +356,29 @@ ${JSON.stringify(user, null, 2)}
   }
 }
 
+// Style Tags and Suggested Outfits for a single closet item
+async function generateStyleData({ name, category, color }) {
+  if (String(SKIP_OPENAI).toLowerCase() === 'true') return null;
+  const prompt = `You are a fashion stylist. Given this clothing item, provide:
+1. style_tags: 5-8 comma-separated style descriptors (e.g. 'casual, streetwear, relaxed, everyday, neutral')
+2. suggested_outfits: 2-3 short outfit pairing suggestions (e.g. 'Pair with slim black jeans and white sneakers for a clean casual look')
+
+Item: ${name}, Category: ${category}, Color: ${color}
+
+Respond ONLY with valid JSON: { "style_tags": "...", "suggested_outfits": "..." }`;
+
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.7,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const text  = resp.choices?.[0]?.message?.content || '';
+  const clean = text.replace(/```json|```/g, '').trim();
+  const a = clean.indexOf('{'), b = clean.lastIndexOf('}');
+  if (a === -1 || b === -1) throw new Error(`Non-JSON style response: ${text.slice(0, 200)}`);
+  return JSON.parse(clean.slice(a, b + 1));
+}
+
 async function describeImage({ imageUrl }) {
   if (String(SKIP_OPENAI).toLowerCase() === 'true') {
     return { name: 'Basic item', category: 'tee', color: 'white', brand: '' };
@@ -517,6 +540,22 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
     };
 
     res.status(201).json({ data: item, item, message: 'created' }); // dual shape
+
+    // Async: enrich new item with Style Tags + Suggested Outfits (non-blocking)
+    setImmediate(async () => {
+      try {
+        const styleData = await generateStyleData({ name, category: category || '', color: color || '' });
+        if (styleData) {
+          await tbCloset.update(r.id, {
+            'Style Tags':       String(styleData.style_tags || '').trim(),
+            'Suggested Outfits': String(styleData.suggested_outfits || '').trim(),
+          });
+          console.log(`[closet] style data saved for new item: ${r.id} "${name}"`);
+        }
+      } catch (e) {
+        console.warn(`[closet] style data generation failed for ${r.id}:`, e?.message);
+      }
+    });
   } catch (err) { next(err); }
 });
 
