@@ -11,6 +11,7 @@ import Airtable from 'airtable';
 import { z } from 'zod';
 import OpenAI from 'openai';
 import crypto from 'crypto'; // Cloudinary signature
+import Stripe from 'stripe';
 
 // ---------- PROCESS SAFETY ----------
 process.on('unhandledRejection', (err) => { console.error('UNHANDLED_REJECTION', err); });
@@ -65,8 +66,16 @@ const {
   CLOUDINARY_FOLDER = 'outfitted',
 
   // Virtual Try-On — add FASHN_API_KEY to Render environment variables
-  FASHN_API_KEY
+  FASHN_API_KEY,
+
+  // Stripe — add keys to Render environment variables
+  STRIPE_SECRET_KEY,
+  STRIPE_PUBLISHABLE_KEY,
+  STRIPE_WEBHOOK_SECRET,
 } = process.env;
+
+// Stripe client — initialised lazily so missing key gives a clear error at request time
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-04-10' }) : null;
 
 // --- eBay OAuth token state (auto-refreshed, never hardcoded) ---
 let ebayAccessToken  = '';
@@ -1545,6 +1554,100 @@ app.post('/api/vto', requireApiKey, async (req, res, next) => {
 
     return res.status(408).json({ error: { code: 'VTO_TIMEOUT', message: 'Virtual Try-On timed out after 60 seconds' } });
   } catch (err) { next(err); }
+});
+
+// ---------- PAYMENTS ----------
+
+// POST /api/payments/intent — creates a Stripe PaymentIntent and returns clientSecret
+app.post('/api/payments/intent', requireApiKey, async (req, res, next) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: { code: 'STRIPE_NOT_CONFIGURED', message: 'Stripe is not configured on this server' } });
+    }
+    const buyerId   = requireUserId(req);
+    const { listingId } = req.body;
+    if (!listingId || typeof listingId !== 'string') {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'listingId is required' } });
+    }
+
+    // Look up listing to get the authoritative price
+    let listing;
+    try {
+      listing = await tbListings.find(listingId);
+    } catch {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Listing not found' } });
+    }
+    const price = listing.fields['Price'];
+    if (typeof price !== 'number' || price <= 0) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Listing has no valid price' } });
+    }
+
+    const priceInCents = Math.round(price * 100);
+    const intent = await stripe.paymentIntents.create({
+      amount:   priceInCents,
+      currency: 'usd',
+      metadata: {
+        listingId,
+        buyerId,
+        listingName: String(listing.fields['Name'] ?? ''),
+        sellerId:    String(listing.fields['Seller ID'] ?? ''),
+        sellerName:  String(listing.fields['Seller Name'] ?? ''),
+        imageUrl:    String(listing.fields['Image URL'] ?? ''),
+        price:       String(price),
+      },
+    });
+
+    console.log('[payments/intent] created intent:', intent.id, 'for listing:', listingId, 'amount:', priceInCents);
+    res.json({ clientSecret: intent.client_secret, publishableKey: STRIPE_PUBLISHABLE_KEY ?? '' });
+  } catch (err) { next(err); }
+});
+
+// POST /api/payments/webhook — Stripe webhook; express.raw is required so the signature verifies
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), async (req, res, next) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    return res.status(503).json({ error: 'Stripe webhook not configured' });
+  }
+
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.warn('[payments/webhook] signature verification failed:', err.message);
+    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
+  }
+
+  if (event.type === 'payment_intent.succeeded') {
+    const intent = event.data.object;
+    const { listingId, buyerId, listingName, sellerId, sellerName, imageUrl, price } = intent.metadata;
+    console.log('[payments/webhook] payment_intent.succeeded — listing:', listingId, 'buyer:', buyerId);
+
+    try {
+      // Create order in Airtable
+      await tbOrders.create([{
+        fields: {
+          'Listing ID':   listingId,
+          'Listing Name': listingName || '',
+          'Price':        parseFloat(price) || 0,
+          'Buyer ID':     buyerId,
+          'Seller ID':    sellerId   || '',
+          'Seller Name':  sellerName || '',
+          'Status':       'Pending',
+          'Created At':   new Date().toISOString(),
+          'Image URL':    imageUrl   || '',
+        }
+      }], { typecast: true });
+
+      // Mark listing as Sold
+      await tbListings.update(listingId, { 'Status': 'Sold' });
+      console.log('[payments/webhook] order created + listing marked Sold for:', listingId);
+    } catch (err) {
+      console.error('[payments/webhook] post-payment processing failed:', err.message);
+      // Still return 200 — Stripe will retry on 4xx/5xx
+    }
+  }
+
+  res.json({ received: true });
 });
 
 // ---------- ERROR HANDLER ----------
