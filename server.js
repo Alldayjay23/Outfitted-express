@@ -256,12 +256,12 @@ const DescribeSchema = z.object({
 });
 
 // ---------- OPENAI ----------
-async function generateOutfitsWithAI({ items, occasion, weather, style, topK, conversationMessages, excludeIds = [] }) {
+async function generateOutfitsWithAI({ items, occasion, weather, style, topK, conversationMessages, excludeIds = [], selectedArchetype }) {
   if (String(SKIP_OPENAI).toLowerCase() === 'true') {
     return [{
       name: `${style || 'Look'} for ${occasion}`,
       items: items.slice(0, 4).map(i => i.id),
-      archetype: 'Classic',
+      archetype: selectedArchetype || 'Classic',
       reasoning: 'Debug: SKIP_OPENAI enabled.',
       palette: ['neutral'],
     }];
@@ -280,22 +280,12 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK, co
     : shuffled;
   const itemsToUse = available.length >= 3 ? available : shuffled;
 
-  // Extract the archetype last used from conversation history so we can pick a different one
-  let lastArchetype = '';
-  if (conversationMessages) {
-    for (let i = conversationMessages.length - 1; i >= 0; i--) {
-      const m = conversationMessages[i];
-      if (m.role === 'assistant') {
-        const match = m.content.match(/archetype[:\s]+([A-Za-z ]+)/i) ||
-                      m.content.match(/vibe[:\s]+([A-Za-z ]+)/i);
-        if (match) { lastArchetype = match[1].trim().split(/[^A-Za-z ]/)[0].trim(); break; }
-      }
-    }
-  }
-
   const excludeNote = excludeIds.length
     ? `\nDo NOT use any of these item IDs (already shown): ${excludeIds.join(', ')}`
     : '';
+
+  // Check whether any closet items carry an archetype tag so we can add a soft-match instruction
+  const hasItemArchetypes = itemsToUse.some(i => i.fields['Archetype'] || i.fields['Style Archetype']);
 
   const system = `You are a personal fashion stylist. Build creative, complete outfits from the user's closet.
 
@@ -306,11 +296,12 @@ MANDATORY OUTFIT SLOTS — include all three if the closet has them:
 You may optionally add a 4th item: outerwear (jacket, coat, blazer).
 Do NOT include hats, bags, or accessories.
 
-VARIETY — rotate through these archetypes, picking a DIFFERENT one each call:
-Classic, Streetwear, Business Casual, Elevated Casual, Bold, Resort Vacation, Minimalist, Layered${lastArchetype ? `\nThe previous suggestion used "${lastArchetype}" — choose a DIFFERENT archetype this time.` : ''}
+STYLE DIRECTION FOR THIS OUTFIT: ${selectedArchetype}.
+Every item selected MUST be cohesive with the ${selectedArchetype} aesthetic.
+Do not repeat the previous style direction.${hasItemArchetypes ? `\nPrefer items tagged as "${selectedArchetype}" if available in the closet.` : ''}
 ${excludeNote}
 Return ONLY valid JSON (no prose, no markdown fences):
-{"outfits":[{"name":"string","archetype":"string","items":["<record_id>","<record_id>","<record_id>"],"reasoning":"string","palette":["color1","color2"]}]}
+{"outfits":[{"name":"string","archetype":"${selectedArchetype}","items":["<record_id>","<record_id>","<record_id>"],"reasoning":"string","palette":["color1","color2"]}]}
 
 CRITICAL: The "items" array must contain the exact Airtable record IDs (starting with "rec") from the provided closet list. Return 3 IDs (Top + Bottom + Shoes) or 4 with optional outerwear.`;
 
@@ -833,6 +824,23 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     if (conversationMessages) console.log('[suggest] conversationMessages received:', conversationMessages.length);
     if (excludeIds.length) console.log('[suggest] excludeIds:', excludeIds.length);
 
+    // Archetype rotation — pick the next archetype after the one the client last received
+    const ARCHETYPES = [
+      'Classic', 'Streetwear', 'Business Casual',
+      'Elevated Casual', 'Bold & Expressive', 'Minimalist', 'Resort / Vacation'
+    ];
+    const clientLastArchetype = typeof req.body.lastArchetype === 'string' ? req.body.lastArchetype : null;
+    let selectedArchetype;
+    if (clientLastArchetype) {
+      const idx = ARCHETYPES.findIndex(a => a.toLowerCase() === clientLastArchetype.toLowerCase());
+      selectedArchetype = idx >= 0
+        ? ARCHETYPES[(idx + 1) % ARCHETYPES.length]
+        : ARCHETYPES[Math.floor(Math.random() * ARCHETYPES.length)];
+    } else {
+      selectedArchetype = ARCHETYPES[Math.floor(Math.random() * ARCHETYPES.length)];
+    }
+    console.log('[suggest] selectedArchetype:', selectedArchetype);
+
     const items = await fetchClosetItemsByIds(itemIds);
     console.log('[suggest] items fetched from Airtable:', items.length, items.map(i => ({
       id: i.id,
@@ -864,7 +872,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
           palette: Array.from(new Set(items.map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim()).filter(Boolean))).slice(0,5),
           preview: ''
         }]
-      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK, conversationMessages, excludeIds });
+      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK, conversationMessages, excludeIds, selectedArchetype });
 
     // Map each closet item to the category the AI actually saw (post-normalization)
     const aiCategoryById = new Map(
