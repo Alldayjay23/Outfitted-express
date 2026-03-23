@@ -1,8 +1,7 @@
 // scripts/populateStyleData.js
-// One-time batch script: generates Style Tags for all closet items missing it.
-// Style Tags is an Airtable AI field (plain string write).
-// Suggested Outfit Pairing is a read-only Airtable AI field — it auto-generates
-// once Style Tags is populated, so we don't write to it directly.
+// One-time batch script: generates Style Tags and Suggested Outfit Pairing
+// for all closet items missing either field.
+// Both are Airtable AI fields written via plain string with typecast: true.
 //
 // Usage:
 //   node scripts/populateStyleData.js
@@ -35,7 +34,8 @@ const base     = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_I
 const tbCloset = base(AIRTABLE_TABLE_CLOSET);
 const openai   = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-const STYLE_TAGS_FIELD = 'Style Tags';
+const STYLE_TAGS_FIELD          = 'Style Tags';
+const SUGGESTED_OUTFITS_FIELD   = 'Suggested Outfit Pairing';
 const DELAY_MS = 500;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -76,13 +76,14 @@ async function main() {
   const allRecords = await tbCloset.select({ pageSize: 100 }).all();
   console.log(`[populate] Total records found: ${allRecords.length}`);
 
-  // Style Tags is an Airtable AI field — check the nested .value property
+  // Both are Airtable AI fields — check the nested .value property
   const needsUpdate = allRecords.filter(r => {
-    const tagsValue = aiFieldValue(r.fields[STYLE_TAGS_FIELD]);
-    return !tagsValue || tagsValue.trim() === '';
+    const tagsValue    = aiFieldValue(r.fields[STYLE_TAGS_FIELD]);
+    const outfitsValue = aiFieldValue(r.fields[SUGGESTED_OUTFITS_FIELD]);
+    return !tagsValue || tagsValue.trim() === '' || !outfitsValue || outfitsValue.trim() === '';
   });
 
-  console.log(`[populate] Items needing Style Tags: ${needsUpdate.length} (${allRecords.length - needsUpdate.length} already populated, skipping)`);
+  console.log(`[populate] Items needing Style Tags or Suggested Outfit Pairing: ${needsUpdate.length} (${allRecords.length - needsUpdate.length} already populated, skipping)`);
 
   if (needsUpdate.length === 0) {
     console.log('[populate] Nothing to do — all items already have Style Tags.');
@@ -101,10 +102,14 @@ async function main() {
     process.stdout.write(`[populate] item ${i + 1} of ${needsUpdate.length}: ${label} → `);
 
     try {
-      const { style_tags } = await generateStyleTags({ name, category, color });
-      const tagsStr = String(style_tags || '').trim();
+      const { style_tags, suggested_outfits } = await generateStyleTags({ name, category, color });
+      const tagsStr    = String(style_tags    || '').trim();
+      const outfitsStr = String(suggested_outfits || '').trim();
 
-      await tbCloset.update(r.id, { [STYLE_TAGS_FIELD]: tagsStr }, { typecast: true });
+      await tbCloset.update(r.id, {
+        [STYLE_TAGS_FIELD]:        tagsStr,
+        [SUGGESTED_OUTFITS_FIELD]: outfitsStr,
+      }, { typecast: true });
 
       console.log(`done  [${tagsStr}]`);
       done++;
@@ -117,7 +122,6 @@ async function main() {
   }
 
   console.log(`\n[populate] Finished. ${done} updated, ${failed} failed, ${allRecords.length - needsUpdate.length} skipped.`);
-  console.log('[populate] Note: Suggested Outfit Pairing is an Airtable AI field — it auto-generates once Style Tags is set.');
 }
 
 main().catch(err => {

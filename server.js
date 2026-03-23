@@ -267,7 +267,8 @@ async function generateOutfitsWithAI({ items, occasion, weather, style, topK }) 
     }];
   }
 
-  const system = `You are a creative fashion stylist. Each outfit you suggest MUST be completely different from any previous suggestion. You are forbidden from suggesting the same outfit name, the same combination of categories, or the same styling direction twice. Rotate through these archetypes in order, never repeating: casual-streetwear, business-casual, athletic-inspired, evening-out, resort-vacation, layered-transitional, minimalist-clean, bold-statement. Pick the next archetype in the rotation based on the current seed value.
+  const system = `You are a personal fashion stylist with deep knowledge of the user's wardrobe. Each item includes style tags and suggested outfit pairings computed specifically for that item. Use this rich context to build highly personalized, creative outfits. Every outfit MUST use a different archetype from this rotation: casual-streetwear, business-casual, athletic-inspired, evening-out, resort-vacation, layered-transitional, minimalist-clean, bold-statement.
+Never repeat the same combination of items.
 
 Return ONLY valid JSON:
 {"outfits":[{"name":"string","items":["category"],"reasoning":"string","palette":["string"],"preview":""}]}
@@ -277,15 +278,25 @@ IMPORTANT:
 - Limit each outfit to a maximum of 3 items: 1 top + 1 bottom + at most 1 optional layer/outerwear. Do NOT include shoes, hats, accessories, or bags.
 - Pick a fresh, unexpected styling direction every time.`;
 
-  const user = {
-    occasion, weather: weather || '', style: style || '',
-    items: items.map(i => ({
-      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
-      color: readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
-      brand: readField(i.fields, CLOSET_BRAND_FIELD, ['Brand']) || '',
-    })),
-    count: topK
+  const aiFieldValue = (raw) => {
+    if (!raw) return '';
+    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'object' && 'value' in raw) return raw.value || '';
+    return '';
   };
+
+  const aiItems = items.map(i => ({
+    id:              i.id,
+    name:            readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '',
+    category:        readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
+    color:           readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
+    styleTags:       (() => {
+      const raw = i.fields['Style Tags'];
+      const val = aiFieldValue(raw);
+      return Array.isArray(val) ? val.join(', ') : (val || '');
+    })(),
+    suggestedOutfits: aiFieldValue(i.fields['Suggested Outfit Pairing']),
+  }));
 
   const seed = `${Date.now()}-${Math.random()}`;
   console.log('[suggest] seed:', seed);
@@ -297,10 +308,10 @@ Max 3 items per outfit: 1 top + 1 bottom + at most 1 layer. No shoes, hats, or a
 Important: Pick the next archetype in the rotation based on the seed value. NEVER repeat an archetype or styling direction.
 Return ONLY JSON. No prose.
 
-Seed: ${Date.now()}-${Math.random()}
-
-Input:
-${JSON.stringify(user, null, 2)}
+Build an outfit for: occasion=${occasion}, weather=${weather || ''}
+Available items with their style context:
+${aiItems.map(i => `- ${i.name} (${i.category}, ${i.color}) | Tags: ${i.styleTags} | Pairs well with: ${i.suggestedOutfits}`).join('\n')}
+Seed: ${seed}
 `;
 
   const extractJson = (s) => {
