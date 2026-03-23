@@ -256,27 +256,63 @@ const DescribeSchema = z.object({
 });
 
 // ---------- OPENAI ----------
-async function generateOutfitsWithAI({ items, occasion, weather, style, topK, conversationMessages }) {
+async function generateOutfitsWithAI({ items, occasion, weather, style, topK, conversationMessages, excludeIds = [] }) {
   if (String(SKIP_OPENAI).toLowerCase() === 'true') {
     return [{
       name: `${style || 'Look'} for ${occasion}`,
-      items: items.map(i => i.id),
+      items: items.slice(0, 4).map(i => i.id),
+      archetype: 'Classic',
       reasoning: 'Debug: SKIP_OPENAI enabled.',
       palette: ['neutral'],
-      preview: ''
     }];
   }
 
-  const system = `You are a personal fashion stylist with deep knowledge of the user's wardrobe. Each item includes style tags and suggested outfit pairings computed specifically for that item. Use this rich context to build highly personalized, creative outfits. Every outfit MUST use a different archetype from this rotation: casual-streetwear, business-casual, athletic-inspired, evening-out, resort-vacation, layered-transitional, minimalist-clean, bold-statement.
-Never repeat the same combination of items.
+  // Fisher-Yates shuffle so GPT sees items in a different order each call
+  const shuffled = [...items];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
 
-Return ONLY valid JSON:
-{"outfits":[{"name":"string","items":["category"],"reasoning":"string","palette":["string"],"preview":""}]}
+  // Filter out already-shown items; fall back to full list if too few remain for a complete outfit
+  const available = excludeIds.length
+    ? shuffled.filter(i => !excludeIds.includes(i.id))
+    : shuffled;
+  const itemsToUse = available.length >= 3 ? available : shuffled;
 
-IMPORTANT:
-- Each value in the "items" array must be a clothing category name copied exactly from the "category" field of the provided closet items. Do NOT use item names, brands, IDs, or any other value — only the "category" field values. One category per outfit slot.
-- Limit each outfit to a maximum of 3 items: 1 top + 1 bottom + at most 1 optional layer/outerwear. Do NOT include shoes, hats, accessories, or bags.
-- Pick a fresh, unexpected styling direction every time.`;
+  // Extract the archetype last used from conversation history so we can pick a different one
+  let lastArchetype = '';
+  if (conversationMessages) {
+    for (let i = conversationMessages.length - 1; i >= 0; i--) {
+      const m = conversationMessages[i];
+      if (m.role === 'assistant') {
+        const match = m.content.match(/archetype[:\s]+([A-Za-z ]+)/i) ||
+                      m.content.match(/vibe[:\s]+([A-Za-z ]+)/i);
+        if (match) { lastArchetype = match[1].trim().split(/[^A-Za-z ]/)[0].trim(); break; }
+      }
+    }
+  }
+
+  const excludeNote = excludeIds.length
+    ? `\nDo NOT use any of these item IDs (already shown): ${excludeIds.join(', ')}`
+    : '';
+
+  const system = `You are a personal fashion stylist. Build creative, complete outfits from the user's closet.
+
+MANDATORY OUTFIT SLOTS — include all three if the closet has them:
+1. Top — shirt, blouse, tee, sweater, hoodie, tank
+2. Bottom — pants, jeans, trousers, shorts, skirt (REQUIRED — never skip this slot)
+3. Shoes — sneakers, boots, heels, sandals (REQUIRED — never skip this slot)
+You may optionally add a 4th item: outerwear (jacket, coat, blazer).
+Do NOT include hats, bags, or accessories.
+
+VARIETY — rotate through these archetypes, picking a DIFFERENT one each call:
+Classic, Streetwear, Business Casual, Elevated Casual, Bold, Resort Vacation, Minimalist, Layered${lastArchetype ? `\nThe previous suggestion used "${lastArchetype}" — choose a DIFFERENT archetype this time.` : ''}
+${excludeNote}
+Return ONLY valid JSON (no prose, no markdown fences):
+{"outfits":[{"name":"string","archetype":"string","items":["<record_id>","<record_id>","<record_id>"],"reasoning":"string","palette":["color1","color2"]}]}
+
+CRITICAL: The "items" array must contain the exact Airtable record IDs (starting with "rec") from the provided closet list. Return 3 IDs (Top + Bottom + Shoes) or 4 with optional outerwear.`;
 
   const aiFieldValue = (raw) => {
     if (!raw) return '';
@@ -291,38 +327,27 @@ IMPORTANT:
     return '';
   };
 
+  console.log('[suggest] itemsToUse:', itemsToUse.length, '(shuffled, excludeIds:', excludeIds.length, ')');
   console.log('[suggest] raw first item fields:', JSON.stringify(
-    items[0]?.fields || items[0], null, 2
+    itemsToUse[0]?.fields || itemsToUse[0], null, 2
   ));
 
-  const aiItems = items.map(i => ({
-    id:              i.id,
-    name:            readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '',
-    category:        readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
-    color:           readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
-    styleTags:       (() => {
-      const raw = i.fields['Style Tags'];
-      const val = aiFieldValue(raw);
-      return Array.isArray(val) ? val.join(', ') : (val || '');
-    })(),
+  const aiItems = itemsToUse.map(i => ({
+    id:               i.id,
+    name:             readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '',
+    category:         readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
+    color:            readField(i.fields, CLOSET_COLOR_FIELD, ['Color','Colors']) || '',
+    styleTags:        aiFieldValue(i.fields['Style Tags']),
     suggestedOutfits: aiFieldValue(i.fields['Suggested Outfit Pairing']),
   }));
 
-  const seed = `${Date.now()}-${Math.random()}`;
-  console.log('[suggest] seed:', seed);
-  console.log('[suggest] archetype seed:', seed);
+  const prompt = `Build ${topK} outfit suggestion(s) for: occasion="${occasion}", weather="${weather || 'any'}".
 
-  const prompt = `Make ${topK} outfit suggestion(s) from these closet items for the given occasion.
-In each outfit's "items" array, list clothing category names exactly as they appear in the input "category" fields. One category per slot — do not use item names or IDs.
-Max 3 items per outfit: 1 top + 1 bottom + at most 1 layer. No shoes, hats, or accessories.
-Important: Pick the next archetype in the rotation based on the seed value. NEVER repeat an archetype or styling direction.
-Return ONLY JSON. No prose.
-
-Build an outfit for: occasion=${occasion}, weather=${weather || ''}
-Available items with their style context:
-${aiItems.map(i => `- ${i.name} (${i.category}, ${i.color}) | Tags: ${i.styleTags} | Pairs well with: ${i.suggestedOutfits}`).join('\n')}
-Seed: ${seed}
-`;
+Pick one Top, one Bottom, one Shoes (plus optional outerwear) by returning their exact record IDs.
+Available closet items:
+${aiItems.map(i => `ID:${i.id} | ${i.name} | Category:${i.category} | Color:${i.color} | Tags:${i.styleTags || 'n/a'} | Pairs:${i.suggestedOutfits || 'n/a'}`).join('\n')}
+${excludeIds.length ? `\nAlready shown to user (do not reuse): ${excludeIds.join(', ')}` : ''}
+Return ONLY JSON. No prose.`;
 
   const extractJson = (s) => {
     if (!s) return null;
@@ -761,7 +786,15 @@ const CATEGORY_NORMALIZATION_MAP = {
 function normalizeCategory(raw) {
   if (!raw) return raw;
   const lower = raw.toLowerCase().trim();
-  return CATEGORY_NORMALIZATION_MAP[lower] ?? raw;
+  // Exact match first
+  if (CATEGORY_NORMALIZATION_MAP[lower]) return CATEGORY_NORMALIZATION_MAP[lower];
+  // Substring fallback so e.g. "Dress Pants", "Cargo Trousers", "Denim Shorts" all map correctly
+  if (['pant', 'jean', 'trouser', 'chino', 'denim'].some(k => lower.includes(k))) return 'bottom';
+  if (['short', 'skirt'].some(k => lower.includes(k))) return 'bottom';
+  if (['shoe', 'sneaker', 'boot', 'heel', 'sandal', 'loafer', 'oxford', 'flat'].some(k => lower.includes(k))) return 'shoes';
+  if (['jacket', 'coat', 'blazer', 'vest', 'cardigan'].some(k => lower.includes(k))) return 'outerwear';
+  if (['dress', 'jumpsuit', 'romper'].some(k => lower.includes(k))) return 'dress';
+  return raw;
 }
 
 // ------- Transcribe voice (Whisper) -------
@@ -794,8 +827,11 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const { occasion, weather, style, itemIds, topK } = parsed.data;
     // Optional conversation history from multi-turn refinement loop
     const conversationMessages = Array.isArray(req.body.messages) ? req.body.messages : null;
-    console.log('[suggest] itemIds received:', itemIds?.length ?? 0, itemIds);
+    // Item IDs the client has already shown — server filters these out before prompting GPT
+    const excludeIds = Array.isArray(req.body.excludeIds) ? req.body.excludeIds : [];
+    console.log('[suggest] itemIds received:', itemIds?.length ?? 0);
     if (conversationMessages) console.log('[suggest] conversationMessages received:', conversationMessages.length);
+    if (excludeIds.length) console.log('[suggest] excludeIds:', excludeIds.length);
 
     const items = await fetchClosetItemsByIds(itemIds);
     console.log('[suggest] items fetched from Airtable:', items.length, items.map(i => ({
@@ -828,7 +864,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
           palette: Array.from(new Set(items.map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim()).filter(Boolean))).slice(0,5),
           preview: ''
         }]
-      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK, conversationMessages });
+      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK, conversationMessages, excludeIds });
 
     // Map each closet item to the category the AI actually saw (post-normalization)
     const aiCategoryById = new Map(
@@ -842,39 +878,43 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const created = [];
     for (const o of outfits) {
       console.log('[suggest] AI returned items:', JSON.stringify(o.items));
-      console.log('[suggest] available categories:', [...aiCategoryById.values()].join(', '));
 
-      // For each AI-returned category, pick the first closet item whose (normalized) category
-      // matches case-insensitively (with fuzzy aliases). Skip unmatched; deduplicate by item ID.
-      let selectedItems;
+      let selectedItems = [];
       if (Array.isArray(o.items) && o.items.length > 0) {
-        const usedIds = new Set();
-        const matched = [];
-        for (const aiCat of o.items) {
-          const ref = String(aiCat).toLowerCase().trim();
-          const aliases = CATEGORY_MATCH_ALIASES[ref] || [ref];
-          const pick = items.find(i => !usedIds.has(i.id) && aliases.includes(aiCategoryById.get(i.id)));
-          if (pick) {
-            console.log(`[suggest] matched AI category "${aiCat}" → item ${pick.id}`);
-            matched.push(pick);
-            usedIds.add(pick.id);
-          } else {
-            console.log(`[suggest] no closet item found for AI category "${aiCat}" — skipping`);
+        // Primary path: GPT returns Airtable record IDs directly
+        if (o.items.some(v => String(v).startsWith('rec'))) {
+          selectedItems = o.items
+            .map(id => items.find(i => i.id === String(id)))
+            .filter(Boolean);
+          console.log('[suggest] ID-based selection:', selectedItems.length, '/', o.items.length, 'matched');
+        } else {
+          // Fallback: GPT returned category names — use alias matching with substring support
+          console.log('[suggest] falling back to category matching');
+          const usedIds = new Set();
+          for (const aiCat of o.items) {
+            const ref = String(aiCat).toLowerCase().trim();
+            const isBottom = ['pant', 'jean', 'trouser', 'short', 'skirt', 'bottom'].some(k => ref.includes(k));
+            const isShoes  = ['shoe', 'sneaker', 'boot', 'heel', 'sandal'].some(k => ref.includes(k));
+            let aliases;
+            if (isBottom)     aliases = ['bottom', 'pants', 'jeans', 'shorts', 'skirt'];
+            else if (isShoes) aliases = ['shoes', 'sneakers', 'boots', 'heels', 'sandals'];
+            else              aliases = CATEGORY_MATCH_ALIASES[ref] || [ref];
+            const pick = items.find(i => !usedIds.has(i.id) && aliases.includes(aiCategoryById.get(i.id)));
+            if (pick) { selectedItems.push(pick); usedIds.add(pick.id); console.log(`[suggest] matched "${aiCat}" → ${pick.id}`); }
+            else console.log(`[suggest] no match for category "${aiCat}"`);
           }
         }
-        console.log('[suggest] final matched items:', matched.length, '/', items.length);
-        // Cap at 3 items: top + bottom + optional layer
-        const capped = matched.slice(0, 3);
-        selectedItems = capped.length > 0 ? capped : items.slice(0, 3);
-      } else {
-        selectedItems = items;
+      }
+      if (!selectedItems.length) {
+        console.log('[suggest] no items selected — falling back to first 4');
+        selectedItems = items.slice(0, 4);
       }
 
       const fields = {
         [OUTFITS_NAME_FIELD]: o.name,
         [OUTFITS_ITEMS_FIELD]: selectedItems.map(i => i.id),
         [OUTFITS_OCCASION_FIELD]: occasion,
-        [OUTFITS_STYLE_FIELD]: style || '',
+        [OUTFITS_STYLE_FIELD]: o.archetype || style || '',
         [OUTFITS_WEATHER_FIELD]: weather || '',
         [OUTFITS_REASON_FIELD]: o.reasoning || '',
         [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : '',
@@ -885,10 +925,10 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
         else fields[OUTFITS_PHOTO_FIELD] = o.preview;
       }
       const rec = await tbOutfits.create([{ fields }], { typecast: true });
-      created.push({ id: rec[0].id, fields });
+      created.push({ id: rec[0].id, fields, archetype: o.archetype || '' });
     }
 
-    res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields })) });
+    res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields, archetype: c.archetype })) });
   } catch (err) { next(err); }
 });
 
