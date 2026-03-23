@@ -1525,9 +1525,9 @@ app.post('/api/vto', requireApiKey, async (req, res, next) => {
       req.log.info({ msg: 'VTO poll', attempt, status: pollData.status });
 
       if (pollData.status === 'completed') {
-        const resultUrl = Array.isArray(pollData.output) ? pollData.output[0] : pollData.output;
-        if (!resultUrl) return res.status(502).json({ error: { code: 'FASHN_NO_OUTPUT', message: 'Fashn.ai completed but returned no output URL' } });
-        return res.json({ resultUrl });
+        const resultImageUrl = Array.isArray(pollData.output) ? pollData.output[0] : pollData.output;
+        if (!resultImageUrl) return res.status(502).json({ error: { code: 'FASHN_NO_OUTPUT', message: 'Fashn.ai completed but returned no output URL' } });
+        return res.json({ resultImageUrl });
       }
       if (pollData.status === 'failed') {
         const errMsg = pollData.error || pollData.message || 'Unknown Fashn.ai error';
