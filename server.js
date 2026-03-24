@@ -341,11 +341,17 @@ CRITICAL: The "items" array must contain the exact Airtable record IDs (starting
     suggestedOutfits: aiFieldValue(i.fields['Suggested Outfit Pairing']),
   }));
 
+  const bottomItems = aiItems.filter(i => i.category.toLowerCase() === 'bottom');
+  const bottomNote = bottomItems.length > 0
+    ? `\nAvailable Bottoms in this closet: ${bottomItems.map(i => `${i.name} (ID:${i.id})`).join(', ')}. You MUST include one of these.`
+    : '';
+
   const prompt = `Build ${topK} outfit suggestion(s) for: occasion="${occasion}", weather="${weather || 'any'}".
 
 Pick one Top, one Bottom, one Shoes (plus optional outerwear) by returning their exact record IDs.
 Available closet items:
 ${aiItems.map(i => `ID:${i.id} | ${i.name} | Category:${i.category} | Color:${i.color} | Tags:${i.styleTags || 'n/a'} | Pairs:${i.suggestedOutfits || 'n/a'}`).join('\n')}
+${bottomNote}
 ${excludeIds.length ? `\nAlready shown to user (do not reuse): ${excludeIds.join(', ')}` : ''}
 Return ONLY JSON. No prose.`;
 
@@ -778,7 +784,9 @@ const CATEGORY_MATCH_ALIASES = {
 // Category normalization for outfit suggestion
 const CATEGORY_NORMALIZATION_MAP = {
   tee: 'top', shirt: 'top', blouse: 'top', sweater: 'top', hoodie: 'top', tank: 'top', 'long sleeve': 'top',
+  top: 'top', tops: 'top',
   jeans: 'bottom', pants: 'bottom', shorts: 'bottom', skirt: 'bottom', trousers: 'bottom', 'cargo pants': 'bottom',
+  bottom: 'bottom', bottoms: 'bottom',
   jacket: 'outerwear', coat: 'outerwear', blazer: 'outerwear',
   sneakers: 'shoes', boots: 'shoes', heels: 'shoes', sandals: 'shoes', 'running shoes': 'shoes',
 };
@@ -788,8 +796,8 @@ function normalizeCategory(raw) {
   const lower = raw.toLowerCase().trim();
   // Exact match first
   if (CATEGORY_NORMALIZATION_MAP[lower]) return CATEGORY_NORMALIZATION_MAP[lower];
-  // Substring fallback so e.g. "Dress Pants", "Cargo Trousers", "Denim Shorts" all map correctly
-  if (['pant', 'jean', 'trouser', 'chino', 'denim'].some(k => lower.includes(k))) return 'bottom';
+  // Substring fallback so e.g. "Dress Pants", "Cargo Trousers", "Denim Shorts", "Bottoms" all map correctly
+  if (['pant', 'jean', 'trouser', 'chino', 'denim', 'bottom'].some(k => lower.includes(k))) return 'bottom';
   if (['short', 'skirt'].some(k => lower.includes(k))) return 'bottom';
   if (['shoe', 'sneaker', 'boot', 'heel', 'sandal', 'loafer', 'oxford', 'flat'].some(k => lower.includes(k))) return 'shoes';
   if (['jacket', 'coat', 'blazer', 'vest', 'cardigan'].some(k => lower.includes(k))) return 'outerwear';
