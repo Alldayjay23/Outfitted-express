@@ -600,6 +600,7 @@ app.post('/api/closet', requireApiKey, async (req, res, next) => {
           // Style Tags is an Airtable AI field that accepts plain string writes
           await tbCloset.update(r.id, {
             'Style Tags': String(styleData.style_tags || '').trim(),
+            'Suggested Outfit Pairing': String(styleData.suggested_outfits || '').trim(),
           }, { typecast: true });
           console.log(`[closet] style data saved for new item: ${r.id} "${name}"`);
         }
@@ -805,6 +806,53 @@ function normalizeCategory(raw) {
   return raw;
 }
 
+// ─── Outfit suggest helpers ───────────────────────────────────────────────────
+
+function bucketCategory(rawCategory) {
+  const c = (rawCategory || '').toLowerCase();
+  if (['pant', 'jean', 'trouser', 'skirt', 'short', 'bottom'].some(k => c.includes(k))) return 'Bottom';
+  if (['shirt', 'tee', 'top', 'blouse', 'sweater', 'hoodie', 'sweatshirt', 'tank', 'knit', 'polo'].some(k => c.includes(k))) return 'Top';
+  if (['jacket', 'coat', 'blazer', 'outerwear', 'vest', 'cardigan'].some(k => c.includes(k))) return 'Outerwear';
+  if (['shoe', 'sneaker', 'boot', 'sandal', 'loafer', 'heel', 'oxford', 'flat', 'mule'].some(k => c.includes(k))) return 'Shoes';
+  return 'Other';
+}
+
+function pickFromBucket(bucket, excludeIds, archetypeKw) {
+  let pool = bucket.filter(i => !excludeIds.includes(i.id));
+  if (!pool.length) pool = [...bucket]; // fall back if all excluded
+  if (!pool.length) return null;
+  if (archetypeKw) {
+    const preferred = pool.filter(i => (i.styleTags || '').toLowerCase().includes(archetypeKw));
+    if (preferred.length) return preferred[Math.floor(Math.random() * preferred.length)];
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function generateOutfitNarration({ items, occasion, weather, archetype }) {
+  if (String(SKIP_OPENAI).toLowerCase() === 'true') {
+    return { description: `A ${archetype} look for ${occasion}.`, tip: 'Mix textures for added depth.' };
+  }
+  const itemList = items.map(i => `${i.name} (${i.category}, ${i.color})`).join(', ');
+  const prompt = `Write a 2-sentence description for this outfit:\nItems: ${itemList}\nOccasion: ${occasion}\nWeather: ${weather || 'any'}\nStyle direction: ${archetype}\n\nAlso write one short styling tip (1 sentence).\n\nRespond ONLY with valid JSON:\n{ "description": "...", "tip": "..." }`;
+  try {
+    const resp = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      temperature: 0.8,
+      messages: [
+        { role: 'system', content: 'You are a stylist writing outfit descriptions for a fashion app.' },
+        { role: 'user', content: prompt },
+      ],
+    });
+    const text = resp.choices?.[0]?.message?.content || '';
+    const clean = text.replace(/```json|```/g, '').trim();
+    const a = clean.indexOf('{'), b = clean.lastIndexOf('}');
+    if (a === -1 || b === -1) return { description: '', tip: '' };
+    return JSON.parse(clean.slice(a, b + 1));
+  } catch {
+    return { description: '', tip: '' };
+  }
+}
+
 // ------- Transcribe voice (Whisper) -------
 app.post('/api/outfits/transcribe', requireApiKey, async (req, res, next) => {
   try {
@@ -858,102 +906,88 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     }
     console.log('[suggest] selectedArchetype:', selectedArchetype);
 
-    const items = await fetchClosetItemsByIds(itemIds);
-    console.log('[suggest] items fetched from Airtable:', items.length, items.map(i => ({
-      id: i.id,
-      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-    })));
-    if (!items.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
+    const rawItems = await fetchClosetItemsByIds(itemIds);
+    if (!rawItems.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
-    // Build AI-facing items with normalized categories; original item data is preserved for the response
-    const itemsForAI = items.map(item => {
-      const rawCat = readField(item.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '';
-      const normalizedCat = normalizeCategory(rawCat);
-      console.log(`[suggest] normalizeCategory: "${rawCat}" → "${normalizedCat}" (id: ${item.id})`);
-      if (normalizedCat === rawCat) return item;
-      return { ...item, fields: { ...item.fields, [CLOSET_CATEGORY_FIELD]: normalizedCat } };
-    });
-
-    console.log('[suggest] itemsForAI sent to AI:', itemsForAI.map(i => ({
-      id: i.id,
-      name: readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']),
-      category: readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']),
-    })));
-
-    const outfits = (String(SKIP_OPENAI).toLowerCase() === 'true')
-      ? [{
-          name: `${style ? `${style} ` : ''}${occasion} fit`.trim(),
-          items: items.map(i => i.id),
-          reasoning: `Server stub (no AI): combined ${items.length} item(s) for ${occasion}${style ? ` in ${style} style.` : '.'}`,
-          palette: Array.from(new Set(items.map(i => String(i.fields['Color'] || i.fields['Colors'] || '').trim()).filter(Boolean))).slice(0,5),
-          preview: ''
-        }]
-      : await generateOutfitsWithAI({ items: itemsForAI, occasion, weather, style, topK, conversationMessages, excludeIds, selectedArchetype });
-
-    // Map each closet item to the category the AI actually saw (post-normalization)
-    const aiCategoryById = new Map(
-      itemsForAI.map(i => [
-        i.id,
-        (readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '').toLowerCase().trim()
-      ])
-    );
-    console.log('[suggest] AI-visible categories:', [...aiCategoryById.entries()].map(([id, cat]) => `${id} → "${cat}"`));
-
-    const created = [];
-    for (const o of outfits) {
-      console.log('[suggest] AI returned items:', JSON.stringify(o.items));
-
-      let selectedItems = [];
-      if (Array.isArray(o.items) && o.items.length > 0) {
-        // Primary path: GPT returns Airtable record IDs directly
-        if (o.items.some(v => String(v).startsWith('rec'))) {
-          selectedItems = o.items
-            .map(id => items.find(i => i.id === String(id)))
-            .filter(Boolean);
-          console.log('[suggest] ID-based selection:', selectedItems.length, '/', o.items.length, 'matched');
-        } else {
-          // Fallback: GPT returned category names — use alias matching with substring support
-          console.log('[suggest] falling back to category matching');
-          const usedIds = new Set();
-          for (const aiCat of o.items) {
-            const ref = String(aiCat).toLowerCase().trim();
-            const isBottom = ['pant', 'jean', 'trouser', 'short', 'skirt', 'bottom'].some(k => ref.includes(k));
-            const isShoes  = ['shoe', 'sneaker', 'boot', 'heel', 'sandal'].some(k => ref.includes(k));
-            let aliases;
-            if (isBottom)     aliases = ['bottom', 'pants', 'jeans', 'shorts', 'skirt'];
-            else if (isShoes) aliases = ['shoes', 'sneakers', 'boots', 'heels', 'sandals'];
-            else              aliases = CATEGORY_MATCH_ALIASES[ref] || [ref];
-            const pick = items.find(i => !usedIds.has(i.id) && aliases.includes(aiCategoryById.get(i.id)));
-            if (pick) { selectedItems.push(pick); usedIds.add(pick.id); console.log(`[suggest] matched "${aiCat}" → ${pick.id}`); }
-            else console.log(`[suggest] no match for category "${aiCat}"`);
-          }
-        }
+    // Build enriched item objects including Style Tags for server-side selection
+    const aiFieldVal = (raw) => {
+      if (!raw) return '';
+      if (typeof raw === 'string') return raw;
+      if (Array.isArray(raw)) return raw.join(', ');
+      if (typeof raw === 'object' && 'value' in raw) {
+        const v = raw.value;
+        if (!v) return '';
+        if (Array.isArray(v)) return v.join(', ');
+        return String(v);
       }
-      if (!selectedItems.length) {
-        console.log('[suggest] no items selected — falling back to first 4');
-        selectedItems = items.slice(0, 4);
-      }
+      return '';
+    };
+    const enriched = rawItems.map(i => ({
+      id:        i.id,
+      name:      readField(i.fields, CLOSET_NAME_FIELD,     ['Item Name','Name','Title','Item']) || '',
+      category:  readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
+      color:     readField(i.fields, CLOSET_COLOR_FIELD,    ['Color','Colors']) || '',
+      imageUrl:  readPhotoFromFields(i.fields) || '',
+      styleTags: aiFieldVal(i.fields['Style Tags']),
+    }));
 
-      const fields = {
-        [OUTFITS_NAME_FIELD]: o.name,
-        [OUTFITS_ITEMS_FIELD]: selectedItems.map(i => i.id),
-        [OUTFITS_OCCASION_FIELD]: occasion,
-        [OUTFITS_STYLE_FIELD]: o.archetype || style || '',
-        [OUTFITS_WEATHER_FIELD]: weather || '',
-        [OUTFITS_REASON_FIELD]: o.reasoning || '',
-        [OUTFITS_PALETTE_FIELD]: Array.isArray(o.palette) ? o.palette.join(', ') : '',
-        [USER_ID_FIELD]: getUserId(req)
-      };
-      if (o.preview) {
-        if (OUTFITS_PHOTO_IS_ATTACHMENT) fields[OUTFITS_PHOTO_FIELD] = [{ url: o.preview }];
-        else fields[OUTFITS_PHOTO_FIELD] = o.preview;
-      }
-      const rec = await tbOutfits.create([{ fields }], { typecast: true });
-      created.push({ id: rec[0].id, fields, archetype: o.archetype || '' });
+    // Bucket items by category using substring matching
+    const buckets = { Top: [], Bottom: [], Shoes: [], Outerwear: [], Other: [] };
+    for (const item of enriched) {
+      const bucket = bucketCategory(item.category);
+      buckets[bucket].push(item);
+    }
+    console.log('[suggest] buckets:', Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])));
+
+    // Server-side selection — prefer items whose Style Tags mention the archetype keyword
+    const archetypeKw = selectedArchetype.toLowerCase().replace(/[^a-z ]/g, '').split(/\s+/)[0];
+    const top       = pickFromBucket(buckets.Top,       excludeIds, archetypeKw);
+    const bottom    = pickFromBucket(buckets.Bottom,    excludeIds, archetypeKw);
+    const shoes     = pickFromBucket(buckets.Shoes,     excludeIds, archetypeKw);
+    const outerwear = pickFromBucket(buckets.Outerwear, excludeIds, archetypeKw);
+    const selectedItems = [top, bottom, shoes, outerwear].filter(Boolean);
+
+    console.log('[suggest] server-selected:', selectedItems.map(i => `${i.name} (${i.category})`));
+    if (!selectedItems.length) {
+      return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'No suitable items found in closet' } });
     }
 
-    res.status(201).json({ data: created.map(c => ({ id: c.id, ...c.fields, archetype: c.archetype })) });
+    // GPT narration only — describe the selected outfit, no item selection by AI
+    const { description, tip } = await generateOutfitNarration({
+      items: selectedItems,
+      occasion,
+      weather,
+      archetype: selectedArchetype,
+    });
+
+    // Save outfit record to Airtable for archive history (non-fatal if it fails)
+    let outfitRecordId = null;
+    try {
+      const rec = await tbOutfits.create([{
+        fields: {
+          [OUTFITS_NAME_FIELD]:    `${selectedArchetype} look for ${occasion}`,
+          [OUTFITS_ITEMS_FIELD]:   selectedItems.map(i => i.id),
+          [OUTFITS_OCCASION_FIELD]: occasion,
+          [OUTFITS_STYLE_FIELD]:   selectedArchetype,
+          [OUTFITS_WEATHER_FIELD]: weather || '',
+          [OUTFITS_REASON_FIELD]:  description || '',
+          [USER_ID_FIELD]:         getUserId(req),
+        }
+      }], { typecast: true });
+      outfitRecordId = rec[0].id;
+    } catch (e) {
+      console.warn('[suggest] Airtable outfit save failed (non-fatal):', e?.message);
+    }
+
+    res.status(201).json({
+      data: [{
+        id:          outfitRecordId,
+        items:       selectedItems,
+        archetype:   selectedArchetype,
+        description: description || '',
+        tip:         tip || '',
+      }]
+    });
   } catch (err) { next(err); }
 });
 
