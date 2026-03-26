@@ -9,7 +9,7 @@ import pinoHttp from 'pino-http';
 import { v4 as uuidv4 } from 'uuid';
 import Airtable from 'airtable';
 import { z } from 'zod';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 import crypto from 'crypto'; // Cloudinary signature
 import Stripe from 'stripe';
 
@@ -863,7 +863,6 @@ app.post('/api/outfits/transcribe', requireApiKey, async (req, res, next) => {
     }
     const buffer = Buffer.from(audio, 'base64');
     console.log('[transcribe] decoded buffer size:', buffer.length, 'bytes');
-    const { toFile } = require('openai');
     const file = await toFile(buffer, 'audio.m4a', { type: mimeType || 'audio/m4a' });
     const transcription = await openai.audio.transcriptions.create({
       model: 'whisper-1',
