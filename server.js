@@ -907,6 +907,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     console.log('[suggest] selectedArchetype:', selectedArchetype);
 
     const rawItems = await fetchClosetItemsByIds(itemIds);
+    console.log('[suggest] closet items fetched:', rawItems.length)
     if (!rawItems.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
     // Build enriched item objects including Style Tags for server-side selection
@@ -938,6 +939,11 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
       buckets[bucket].push(item);
     }
     console.log('[suggest] buckets:', Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])));
+    console.log('[suggest] buckets:', {
+      tops: buckets.Top?.length,
+      bottoms: buckets.Bottom?.length,
+      shoes: buckets.Shoes?.length
+    })
 
     // Server-side selection — prefer items whose Style Tags mention the archetype keyword
     const archetypeKw = selectedArchetype.toLowerCase().replace(/[^a-z ]/g, '').split(/\s+/)[0];
@@ -948,6 +954,8 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const selectedItems = [top, bottom, shoes, outerwear].filter(Boolean);
 
     console.log('[suggest] server-selected:', selectedItems.map(i => `${i.name} (${i.category})`));
+    console.log('[suggest] selected items:', selectedItems.map(i =>
+      ({ id: i.id, name: i.name, category: i.category })))
     if (!selectedItems.length) {
       return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'No suitable items found in closet' } });
     }
@@ -979,6 +987,11 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
       console.warn('[suggest] Airtable outfit save failed (non-fatal):', e?.message);
     }
 
+    console.log('[suggest] response shape:', {
+      itemCount: selectedItems.length,
+      hasDescription: !!description,
+      firstItem: selectedItems[0]
+    })
     res.status(201).json({
       data: [{
         id:          outfitRecordId,
