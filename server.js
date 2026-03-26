@@ -857,17 +857,22 @@ async function generateOutfitNarration({ items, occasion, weather, archetype }) 
 app.post('/api/outfits/transcribe', requireApiKey, async (req, res, next) => {
   try {
     const { audio, mimeType } = req.body;
+    console.log('[transcribe] request received — content-type:', req.headers['content-type'], '| audio length:', audio?.length ?? 'MISSING', '| mimeType:', mimeType ?? 'not set');
     if (!audio || typeof audio !== 'string') {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'audio (base64) is required' } });
     }
     const buffer = Buffer.from(audio, 'base64');
+    console.log('[transcribe] decoded buffer size:', buffer.length, 'bytes');
     const { toFile } = require('openai');
     const file = await toFile(buffer, 'audio.m4a', { type: mimeType || 'audio/m4a' });
     const transcription = await openai.audio.transcriptions.create({
       model: 'whisper-1',
       file,
     });
-    res.json({ text: transcription.text });
+    console.log('[transcribe] Whisper raw response:', JSON.stringify(transcription));
+    const responseBody = { text: transcription.text };
+    console.log('[transcribe] sending to client:', JSON.stringify(responseBody));
+    res.json(responseBody);
   } catch (err) { next(err); }
 });
 
