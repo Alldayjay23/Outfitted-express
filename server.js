@@ -1008,6 +1008,126 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ------- Suggest a full week of outfits (7 days, no back-to-back repeats) -------
+app.post('/api/outfits/week', requireApiKey, async (req, res, next) => {
+  try {
+    const { occasion, weather, itemIds } = req.body;
+    if (!occasion || !Array.isArray(itemIds) || !itemIds.length) {
+      return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'occasion and itemIds are required' } });
+    }
+
+    const WEEK_ARCHETYPES = [
+      'Classic', 'Streetwear', 'Business Casual',
+      'Elevated Casual', 'Bold & Expressive', 'Minimalist', 'Resort / Vacation'
+    ];
+    const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+    const rawItems = await fetchClosetItemsByIds(itemIds);
+    if (!rawItems.length) {
+      return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
+    }
+
+    const aiFieldVal = (raw) => {
+      if (!raw) return '';
+      if (typeof raw === 'string') return raw;
+      if (Array.isArray(raw)) return raw.join(', ');
+      if (typeof raw === 'object' && 'value' in raw) {
+        const v = raw.value;
+        if (!v) return '';
+        if (Array.isArray(v)) return v.join(', ');
+        return String(v);
+      }
+      return '';
+    };
+
+    const enriched = rawItems.map(i => ({
+      id:        i.id,
+      name:      readField(i.fields, CLOSET_NAME_FIELD,     ['Item Name','Name','Title','Item']) || '',
+      category:  readField(i.fields, CLOSET_CATEGORY_FIELD, ['Category']) || '',
+      color:     readField(i.fields, CLOSET_COLOR_FIELD,    ['Color','Colors']) || '',
+      imageUrl:  readPhotoFromFields(i.fields) || '',
+      styleTags: aiFieldVal(i.fields['Style Tags']),
+    }));
+
+    const buckets = { Top: [], Bottom: [], Shoes: [], Outerwear: [], Other: [] };
+    for (const item of enriched) {
+      buckets[bucketCategory(item.category)].push(item);
+    }
+
+    // Per-category tracking: usedIds and exhausted-set reset logic
+    // usedThisRound tracks ids used in the current "round" for each bucket
+    const usedPerCategory = { Top: new Set(), Bottom: new Set(), Shoes: new Set(), Outerwear: new Set() };
+
+    // Track item used on the immediately previous day to prevent back-to-back
+    const prevDayIds = new Set();
+
+    function pickWeekItem(bucket, bucketName, archetypeKw) {
+      const all = buckets[bucketName];
+      if (!all.length) return null;
+
+      // Prefer not used in this round AND not used yesterday
+      let pool = all.filter(i => !usedPerCategory[bucketName].has(i.id) && !prevDayIds.has(i.id));
+      // If exhausted unused items, reset the round tracking (but still avoid yesterday)
+      if (!pool.length) {
+        usedPerCategory[bucketName].clear();
+        pool = all.filter(i => !prevDayIds.has(i.id));
+      }
+      // Last resort: all items (closet too small to avoid yesterday's item)
+      if (!pool.length) pool = [...all];
+
+      let chosen;
+      if (archetypeKw) {
+        const preferred = pool.filter(i => (i.styleTags || '').toLowerCase().includes(archetypeKw));
+        chosen = preferred.length
+          ? preferred[Math.floor(Math.random() * preferred.length)]
+          : pool[Math.floor(Math.random() * pool.length)];
+      } else {
+        chosen = pool[Math.floor(Math.random() * pool.length)];
+      }
+      usedPerCategory[bucketName].add(chosen.id);
+      return chosen;
+    }
+
+    // Shuffle the archetype order starting from a random offset for variety
+    const archetypeOffset = Math.floor(Math.random() * WEEK_ARCHETYPES.length);
+
+    const weekOutfits = [];
+    for (let d = 0; d < 7; d++) {
+      const archetype = WEEK_ARCHETYPES[(archetypeOffset + d) % WEEK_ARCHETYPES.length];
+      const archetypeKw = archetype.toLowerCase().replace(/[^a-z ]/g, '').split(/\s+/)[0];
+
+      const top       = pickWeekItem(buckets.Top,       'Top',       archetypeKw);
+      const bottom    = pickWeekItem(buckets.Bottom,    'Bottom',    archetypeKw);
+      const shoes     = pickWeekItem(buckets.Shoes,     'Shoes',     archetypeKw);
+      const outerwear = pickWeekItem(buckets.Outerwear, 'Outerwear', archetypeKw);
+      const selectedItems = [top, bottom, shoes, outerwear].filter(Boolean);
+
+      // GPT narration for this day's outfit
+      const { description, tip } = await generateOutfitNarration({
+        items: selectedItems,
+        occasion,
+        weather: weather || '',
+        archetype,
+      });
+
+      weekOutfits.push({
+        day:      DAYS[d],
+        archetype,
+        items:    selectedItems,
+        description: description || '',
+        tip:         tip || '',
+      });
+
+      // Update prevDayIds to the ids selected today
+      prevDayIds.clear();
+      for (const item of selectedItems) prevDayIds.add(item.id);
+    }
+
+    console.log('[week] generated', weekOutfits.length, 'outfits');
+    res.status(200).json({ data: weekOutfits });
+  } catch (err) { next(err); }
+});
+
 // ------- Outfits: save exact items (stores user id) -------
 app.post('/api/outfits/save', requireApiKey, async (req, res, next) => {
   try {
