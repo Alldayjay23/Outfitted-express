@@ -12,6 +12,25 @@ import { z } from 'zod';
 import OpenAI, { toFile } from 'openai';
 import crypto from 'crypto'; // Cloudinary signature
 import Stripe from 'stripe';
+import admin from 'firebase-admin';
+import twilio from 'twilio';
+
+// ---------- FIREBASE ADMIN ----------
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    }),
+  });
+}
+
+// ---------- TWILIO ----------
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 // ---------- PROCESS SAFETY ----------
 process.on('unhandledRejection', (err) => { console.error('UNHANDLED_REJECTION', err); });
@@ -1827,6 +1846,57 @@ app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), asy
   }
 
   res.json({ received: true });
+});
+
+// ---------- SMS AUTH ----------
+const otpStore = new Map();
+
+app.post('/api/auth/send-code', requireApiKey, async (req, res, next) => {
+  try {
+    const { phoneNumber } = req.body;
+    if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber is required' });
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    otpStore.set(phoneNumber, { code, expires: Date.now() + 10 * 60 * 1000 });
+
+    await twilioClient.messages.create({
+      body: `Your Outfitted verification code is ${code}. Valid for 10 minutes.`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: phoneNumber,
+    });
+
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+app.post('/api/auth/verify-code', requireApiKey, async (req, res, next) => {
+  try {
+    const { phoneNumber, code } = req.body;
+    if (!phoneNumber || !code) return res.status(400).json({ error: 'phoneNumber and code are required' });
+
+    const stored = otpStore.get(phoneNumber);
+    if (!stored) return res.status(400).json({ error: 'Code expired or not found' });
+    if (Date.now() > stored.expires) return res.status(400).json({ error: 'Code expired' });
+    if (stored.code !== code) return res.status(400).json({ error: 'Invalid code' });
+
+    otpStore.delete(phoneNumber);
+
+    let uid;
+    try {
+      const userRecord = await admin.auth().getUserByPhoneNumber(phoneNumber);
+      uid = userRecord.uid;
+    } catch (e) {
+      if (e.code === 'auth/user-not-found') {
+        const newUser = await admin.auth().createUser({ phoneNumber });
+        uid = newUser.uid;
+      } else {
+        throw e;
+      }
+    }
+
+    const customToken = await admin.auth().createCustomToken(uid);
+    res.json({ customToken });
+  } catch (err) { next(err); }
 });
 
 // ---------- ERROR HANDLER ----------

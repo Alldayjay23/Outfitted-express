@@ -16,11 +16,13 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.1.5",
+    "firebase-admin": "^13.7.0",
     "helmet": "^7.1.0",
     "openai": "^4.57.0",
     "pino": "^9.3.2",
     "pino-http": "^10.3.0",
     "stripe": "^20.4.1",
+    "twilio": "^5.13.1",
     "uuid": "^9.0.1",
     "zod": "^3.23.8"
   },
