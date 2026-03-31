@@ -1073,25 +1073,20 @@ app.post('/api/outfits/week', requireApiKey, async (req, res, next) => {
       buckets[bucketCategory(item.category)].push(item);
     }
 
-    // Per-category tracking: usedIds and exhausted-set reset logic
-    // usedThisRound tracks ids used in the current "round" for each bucket
-    const usedPerCategory = { Top: new Set(), Bottom: new Set(), Shoes: new Set(), Outerwear: new Set() };
+    // Track every item used across the entire week — minimize any repeats.
+    // prevDayIds is a strict hard block: never repeat back-to-back under any circumstance.
+    const usedItemIds = new Set();
+    const prevDayIds  = new Set();
 
-    // Track item used on the immediately previous day to prevent back-to-back
-    const prevDayIds = new Set();
-
-    function pickWeekItem(bucket, bucketName, archetypeKw) {
+    function pickWeekItem(bucketName, archetypeKw) {
       const all = buckets[bucketName];
       if (!all.length) return null;
 
-      // Prefer not used in this round AND not used yesterday
-      let pool = all.filter(i => !usedPerCategory[bucketName].has(i.id) && !prevDayIds.has(i.id));
-      // If exhausted unused items, reset the round tracking (but still avoid yesterday)
-      if (!pool.length) {
-        usedPerCategory[bucketName].clear();
-        pool = all.filter(i => !prevDayIds.has(i.id));
-      }
-      // Last resort: all items (closet too small to avoid yesterday's item)
+      // Tier 1: unused this week AND not used yesterday (ideal)
+      let pool = all.filter(i => !usedItemIds.has(i.id) && !prevDayIds.has(i.id));
+      // Tier 2: already used earlier in the week but not yesterday (allow repeat, skip back-to-back)
+      if (!pool.length) pool = all.filter(i => !prevDayIds.has(i.id));
+      // Tier 3: absolute last resort — bucket has only 1 item; forced repeat
       if (!pool.length) pool = [...all];
 
       let chosen;
@@ -1103,7 +1098,6 @@ app.post('/api/outfits/week', requireApiKey, async (req, res, next) => {
       } else {
         chosen = pool[Math.floor(Math.random() * pool.length)];
       }
-      usedPerCategory[bucketName].add(chosen.id);
       return chosen;
     }
 
@@ -1115,10 +1109,10 @@ app.post('/api/outfits/week', requireApiKey, async (req, res, next) => {
       const archetype = WEEK_ARCHETYPES[(archetypeOffset + d) % WEEK_ARCHETYPES.length];
       const archetypeKw = archetype.toLowerCase().replace(/[^a-z ]/g, '').split(/\s+/)[0];
 
-      const top       = pickWeekItem(buckets.Top,       'Top',       archetypeKw);
-      const bottom    = pickWeekItem(buckets.Bottom,    'Bottom',    archetypeKw);
-      const shoes     = pickWeekItem(buckets.Shoes,     'Shoes',     archetypeKw);
-      const outerwear = pickWeekItem(buckets.Outerwear, 'Outerwear', archetypeKw);
+      const top       = pickWeekItem('Top',       archetypeKw);
+      const bottom    = pickWeekItem('Bottom',    archetypeKw);
+      const shoes     = pickWeekItem('Shoes',     archetypeKw);
+      const outerwear = pickWeekItem('Outerwear', archetypeKw);
       const selectedItems = [top, bottom, shoes, outerwear].filter(Boolean);
 
       // GPT narration for this day's outfit
@@ -1137,9 +1131,13 @@ app.post('/api/outfits/week', requireApiKey, async (req, res, next) => {
         tip:         tip || '',
       });
 
-      // Update prevDayIds to the ids selected today
+      // Register all items selected today — they are now "used" for the rest of the week
+      // and hard-blocked from appearing tomorrow.
       prevDayIds.clear();
-      for (const item of selectedItems) prevDayIds.add(item.id);
+      for (const item of selectedItems) {
+        usedItemIds.add(item.id);
+        prevDayIds.add(item.id);
+      }
     }
 
     console.log('[week] generated', weekOutfits.length, 'outfits');
