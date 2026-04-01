@@ -346,11 +346,6 @@ CRITICAL: The "items" array must contain the exact Airtable record IDs (starting
     return '';
   };
 
-  console.log('[suggest] itemsToUse:', itemsToUse.length, '(shuffled, excludeIds:', excludeIds.length, ')');
-  console.log('[suggest] raw first item fields:', JSON.stringify(
-    itemsToUse[0]?.fields || itemsToUse[0], null, 2
-  ));
-
   const aiItems = itemsToUse.map(i => ({
     id:               i.id,
     name:             readField(i.fields, CLOSET_NAME_FIELD, ['Item Name','Name','Title','Item']) || '',
@@ -388,7 +383,6 @@ Return ONLY JSON. No prose.`;
     : [{ role: 'system', content: system }, { role: 'user', content: prompt }];
 
   try {
-    console.log('[suggest] using path:', 'responses');
     const r = await openai.responses.create({
       model: OPENAI_MODEL,
       temperature: 1.0,
@@ -398,22 +392,18 @@ Return ONLY JSON. No prose.`;
       r.output_text ||
       (Array.isArray(r.output) ? r.output.flatMap(o => (o?.content || []).map(c => c?.text || '')).join('') : '') ||
       '';
-    console.log('[suggest] raw OpenAI response text (responses API):', text?.slice(0, 1000));
     const parsed = extractJson(text);
     if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: text?.slice?.(0, 400) });
     if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
     return parsed.outfits;
   } catch (e1) {
     try {
-      console.log('[suggest] using path:', 'chat');
-      console.log('[suggest] seed (chat fallback):', seed);
       const resp = await openai.chat.completions.create({
         model: OPENAI_MODEL,
         temperature: 1.0,
         messages
       });
       const content = resp.choices?.[0]?.message?.content || '';
-      console.log('[suggest] raw OpenAI response text (chat API fallback):', content?.slice(0, 1000));
       const parsed  = extractJson(content);
       if (!parsed) throw Object.assign(new Error('AI_JSON_PARSE_ERROR'), { status: 502, details: content?.slice?.(0, 400) });
       if (!parsed.outfits?.length) throw Object.assign(new Error('AI_EMPTY_OUTFITS'), { status: 502 });
@@ -876,18 +866,15 @@ async function generateOutfitNarration({ items, occasion, weather, archetype }) 
 app.post('/api/outfits/transcribe', requireApiKey, async (req, res, next) => {
   try {
     const { audio, mimeType } = req.body;
-    console.log('[transcribe] request received — content-type:', req.headers['content-type'], '| audio length:', audio?.length ?? 'MISSING', '| mimeType:', mimeType ?? 'not set');
     if (!audio || typeof audio !== 'string') {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'audio (base64) is required' } });
     }
     const buffer = Buffer.from(audio, 'base64');
-    console.log('[transcribe] decoded buffer size:', buffer.length, 'bytes');
     const file = await toFile(buffer, 'audio.m4a', { type: mimeType || 'audio/m4a' });
     const transcription = await openai.audio.transcriptions.create({
       model: 'whisper-1',
       file,
     });
-    console.log('[transcribe] Whisper raw response:', JSON.stringify(transcription));
     const responseBody = { text: transcription.text };
     console.log('[transcribe] sending to client:', JSON.stringify(responseBody));
     res.json(responseBody);
@@ -908,10 +895,6 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const conversationMessages = Array.isArray(req.body.messages) ? req.body.messages : null;
     // Item IDs the client has already shown — server filters these out before prompting GPT
     const excludeIds = Array.isArray(req.body.excludeIds) ? req.body.excludeIds : [];
-    console.log('[suggest] itemIds received:', itemIds?.length ?? 0);
-    if (conversationMessages) console.log('[suggest] conversationMessages received:', conversationMessages.length);
-    if (excludeIds.length) console.log('[suggest] excludeIds:', excludeIds.length);
-
     // Archetype rotation — pick the next archetype after the one the client last received
     const ARCHETYPES = [
       'Classic', 'Streetwear', 'Business Casual',
@@ -927,10 +910,7 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     } else {
       selectedArchetype = ARCHETYPES[Math.floor(Math.random() * ARCHETYPES.length)];
     }
-    console.log('[suggest] selectedArchetype:', selectedArchetype);
-
     const rawItems = await fetchClosetItemsByIds(itemIds);
-    console.log('[suggest] closet items fetched:', rawItems.length)
     if (!rawItems.length) return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'Provide valid itemIds' } });
 
     // Build enriched item objects including Style Tags for server-side selection
@@ -961,13 +941,6 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
       const bucket = bucketCategory(item.category);
       buckets[bucket].push(item);
     }
-    console.log('[suggest] buckets:', Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])));
-    console.log('[suggest] buckets:', {
-      tops: buckets.Top?.length,
-      bottoms: buckets.Bottom?.length,
-      shoes: buckets.Shoes?.length
-    })
-
     // Server-side selection — prefer items whose Style Tags mention the archetype keyword
     const archetypeKw = selectedArchetype.toLowerCase().replace(/[^a-z ]/g, '').split(/\s+/)[0];
     const top       = pickFromBucket(buckets.Top,       excludeIds, archetypeKw);
@@ -976,9 +949,6 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
     const outerwear = pickFromBucket(buckets.Outerwear, excludeIds, archetypeKw);
     const selectedItems = [top, bottom, shoes, outerwear].filter(Boolean);
 
-    console.log('[suggest] server-selected:', selectedItems.map(i => `${i.name} (${i.category})`));
-    console.log('[suggest] selected items:', selectedItems.map(i =>
-      ({ id: i.id, name: i.name, category: i.category })))
     if (!selectedItems.length) {
       return res.status(400).json({ error: { code: 'NO_ITEMS', message: 'No suitable items found in closet' } });
     }
@@ -1010,11 +980,6 @@ app.post('/api/outfits/suggest', requireApiKey, async (req, res, next) => {
       console.warn('[suggest] Airtable outfit save failed (non-fatal):', e?.message);
     }
 
-    console.log('[suggest] response shape:', {
-      itemCount: selectedItems.length,
-      hasDescription: !!description,
-      firstItem: selectedItems[0]
-    })
     res.status(201).json({
       data: [{
         id:          outfitRecordId,
